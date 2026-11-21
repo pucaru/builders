@@ -1,5 +1,6 @@
 """Select tests and minimize the official simulated scheduling cost."""
 import argparse
+import gc
 import heapq
 import json
 from pathlib import Path
@@ -32,6 +33,8 @@ def schedule(tests):
 
 
 def main():
+    # Reclaim cyclic objects between large batches without scanning after every patch.
+    gc.disable()
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=Path, default=Path("/data"))
     parser.add_argument("--mode", choices=["all", "static", "file", "function", "hybrid",
@@ -42,7 +45,7 @@ def main():
     tests = json.loads((args.data / "tests.json").read_text())["tests"]
     impact = None if args.mode == "all" else Impact(tests, args.map, args.mode)
     plans = {}
-    for patch in sorted((args.data / "commits").glob("*.patch")):
+    for patch_number, patch in enumerate(sorted((args.data / "commits").glob("*.patch"))):
         selection = tests if impact is None else impact.select(
             patch.read_text(encoding="utf-8", errors="surrogateescape"))
         key = tuple(test["number"] for test in selection)
@@ -50,6 +53,8 @@ def main():
             plans[key] = schedule(selection)
         workers = plans[key]
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
+        if patch_number % 32 == 31:
+            gc.collect()
 
 
 if __name__ == "__main__":
