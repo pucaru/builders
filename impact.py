@@ -1916,7 +1916,7 @@ class Impact:
         if (attr in self.scalar_reads["import_reads"].get(key, ())
                 or attr in self.scalar_reads["shared_reads"].get(key, ())):
             return False
-        tree = ast.parse(self.sources[path])
+        tree = self.source_tree(path)
         owners = [node for node in tree.body if isinstance(node, ast.ClassDef)
                   and node.name == class_name]
         if (len(owners) != 1 or owners[0].keywords or owners[0].decorator_list
@@ -1929,7 +1929,7 @@ class Impact:
             return False
         # The metaclass's class-dictionary reads use fixed string keys. A
         # dynamic key could bypass the runtime attribute probe.
-        dialect = ast.parse(self.sources["sqlglot/dialects/dialect.py"])
+        dialect = self.source_tree("sqlglot/dialects/dialect.py")
         metaclass = next((node for node in dialect.body if isinstance(node, ast.ClassDef)
                           and node.name == "_Dialect"), None)
         if metaclass is None:
@@ -1949,32 +1949,45 @@ class Impact:
                     or not call.args or not isinstance(call.args[0], ast.Constant)
                     or type(call.args[0].value) is not str):
                 return False
+        environment = self.scalar_source_environment()
+        if environment is None:
+            return False
+        indirect, byte_string_dict_read = environment
+        if attr == "BYTE_STRING_ESCAPES" and byte_string_dict_read:
+            return False
+        self._scalar_indirect = indirect
+        return True
+
+    @lru_cache(maxsize=1)
+    def scalar_source_environment(self):
+        """Prove source-wide reflective read shapes once per pristine suite."""
         indirect = set()
+        byte_string_dict_read = False
         for source_path, source in self.sources.items():
             if (source_path.startswith("sqlglot/dialects/")
                     and ("__getattribute__" in source or "__getattr__" in source)):
-                for owner in ast.walk(ast.parse(source)):
+                for owner in ast.walk(self.source_tree(source_path)):
                     if (isinstance(owner, ast.ClassDef)
                             and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
                                     and member.name in {"__getattribute__", "__getattr__"}
                                     for member in owner.body)):
-                        return False
+                        return None
             if (source_path.startswith(("sqlglot/", "tests/"))
                     and "object_to_dict(" in source):
-                tree = ast.parse(source)
+                tree = self.source_tree(source_path)
                 if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                        and node.func.id == "object_to_dict" for node in ast.walk(tree)):
-                    return False
+                    return None
             if not source_path.startswith("sqlglot/") or not any(
                     token in source for token in ("__dict__", "vars(")):
                 continue
-            tree = ast.parse(source)
+            tree = self.source_tree(source_path)
             for node in ast.walk(tree):
                 if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                         and node.func.id == "vars"):
                     if (source_path != "sqlglot/helper.py"
                             or ast.unparse(node) != "vars(obj)"):
-                        return False
+                        return None
                 if (not isinstance(node, ast.Attribute) or node.attr != "__dict__"
                         or not isinstance(node.ctx, ast.Load)):
                     continue
@@ -1988,19 +2001,18 @@ class Impact:
                     if (not isinstance(compare, ast.Compare) or len(compare.ops) != 1
                             or not isinstance(compare.ops[0], ast.In)
                             or not isinstance(compare.left, ast.Constant)
-                            or compare.left.value != "BYTE_STRING_ESCAPES"
-                            or attr == "BYTE_STRING_ESCAPES"):
-                        return False
+                            or compare.left.value != "BYTE_STRING_ESCAPES"):
+                        return None
+                    byte_string_dict_read = True
                     continue  # fixed, unrelated dictionary membership
                 if source_path == "sqlglot/expressions/core.py" and shape == "value.__dict__":
                     index = self.lines.get(source_path, {}).get(str(node.lineno))
                     if index is None or "" in self.contexts[index]:
-                        return False
+                        return None
                     indirect.update(self.contexts[index])
                     continue
-                return False
-        self._scalar_indirect = indirect
-        return True
+                return None
+        return frozenset(indirect), byte_string_dict_read
 
     @lru_cache(maxsize=128)
     def scalar_cached_read_safe(self, attr):
@@ -2014,7 +2026,7 @@ class Impact:
         for path, source in self.sources.items():
             if not path.startswith("sqlglot/") or attr not in source:
                 continue
-            tree = ast.parse(source)
+            tree = self.source_tree(path)
             for function in ast.walk(tree):
                 if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
