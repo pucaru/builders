@@ -519,6 +519,9 @@ class Impact:
             self.by_file.setdefault(test["file"], set()).add(test["id"])
             self.by_class.setdefault(test["id"].rsplit("::", 1)[0], set()).add(test["id"])
         self.sources = self.maps["sources"]
+        # Safety proofs repeatedly inspect the same pristine modules for one
+        # batch. Parse them lazily once; patched source is never cached.
+        self._source_trees = {}
         self.static = self.maps["static"]
         self.lines = self.maps.get("lines", {})
         self.contexts = self.maps.get("contexts", [])
@@ -673,6 +676,13 @@ class Impact:
                 self.reference_index = reference["references"]
         except (OSError, ValueError, TypeError):
             pass
+
+    def source_tree(self, path):
+        tree = self._source_trees.get(path)
+        if tree is None:
+            tree = ast.parse(self.sources[path])
+            self._source_trees[path] = tree
+        return tree
 
     def valid_pool_classes(self, pool):
         """Reject an incomplete or stale child map before using class fast paths."""
@@ -850,7 +860,7 @@ class Impact:
             if name not in source:
                 continue
             try:
-                tree = ast.parse(source)
+                tree = self.source_tree(path)
             except (SyntaxError, RecursionError):
                 import_read = True
                 continue
@@ -886,7 +896,7 @@ class Impact:
             if field not in text:
                 continue
             try:
-                tree = ast.parse(text)
+                tree = self.source_tree(source_path)
             except (SyntaxError, RecursionError):
                 return self.all_ids
             nodes = list(ast.walk(tree))
@@ -981,7 +991,7 @@ class Impact:
                 or not all(type(v) is bool for v in after.values())):
             return False
         source = self.sources.get(path, "")
-        tree = ast.parse(source)
+        tree = self.source_tree(path)
         target = None
         for node in ast.walk(tree):
             if (isinstance(node, ast.ClassDef) and node.name == class_name.rsplit(".", 1)[-1]
@@ -991,7 +1001,7 @@ class Impact:
                 break
         if target is None:
             return False
-        core = ast.parse(self.sources["sqlglot/expressions/core.py"])
+        core = self.source_tree("sqlglot/expressions/core.py")
         hook = next((member for c in core.body if isinstance(c, ast.ClassDef) and c.name == "Expr"
                      for member in c.body if isinstance(member, ast.FunctionDef)
                      and member.name == "__init_subclass__"), None)
@@ -1008,7 +1018,7 @@ class Impact:
         for source_path, text in self.sources.items():
             if "required_args" not in text:
                 continue
-            for node in ast.walk(ast.parse(text)):
+            for node in ast.walk(self.source_tree(source_path)):
                 if (isinstance(node, ast.Attribute) and node.attr == "required_args"
                         and isinstance(node.ctx, ast.Load)):
                     derived_sites.append((source_path, node.lineno))
@@ -1047,7 +1057,7 @@ class Impact:
         key = module + ":" + class_name
         if key in self.class_import_constructors or key not in self.class_uses:
             return False
-        source = ast.parse(self.sources[path])
+        source = self.source_tree(path)
         owners = [node for node in source.body if isinstance(node, ast.ClassDef)
                   and node.name == class_name]
         if len(owners) != 1:
@@ -1060,7 +1070,7 @@ class Impact:
                 or any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                        and node.name in {"__init__", "__new__"} for node in owner.body)):
             return False
-        parser = ast.parse(self.sources["sqlglot/parser.py"])
+        parser = self.source_tree("sqlglot/parser.py")
         roots = [node for node in parser.body if isinstance(node, ast.ClassDef)
                  and node.name == "Parser"]
         if (len(roots) != 1 or roots[0].bases or roots[0].keywords
@@ -1087,8 +1097,8 @@ class Impact:
         """
         source = self.sources[path]
 
-        def target(text):
-            tree = ast.parse(text)
+        def target(text, tree=None):
+            tree = tree or ast.parse(text)
             owners = [node for node in tree.body if isinstance(node, ast.ClassDef)
                       and node.name == class_name]
             if len(owners) != 1:
@@ -1109,7 +1119,7 @@ class Impact:
                                and isinstance(value, ast.Lambda))
             return entries[0] if len(entries) == 1 else None
 
-        old, new = target(source), target(patched)
+        old, new = target(source, self.source_tree(path)), target(patched)
         if (old is None or new is None or old.lineno != new.lineno
                 or len(source.splitlines()) != len(patched.splitlines())
                 or not scalar_literal_lambda_body_edit(old.body, new.body)):
@@ -1150,7 +1160,7 @@ class Impact:
                     any(token in text for token in code_fields)
                     or (field in text and "getattr" in text)):
                 continue
-            for node in ast.walk(ast.parse(text)):
+            for node in ast.walk(self.source_tree(source_path)):
                 if (isinstance(node, ast.Attribute) and node.attr in code_fields
                         or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                         and node.func.id == "getattr" and len(node.args) >= 2
@@ -1166,7 +1176,7 @@ class Impact:
                 selected.update(self.by_file.get(test_path, ()))
             if field not in text or entry not in text:
                 continue
-            tree = ast.parse(text)
+            tree = self.source_tree(test_path)
             for node in ast.walk(tree):
                 if (not isinstance(node, ast.Subscript)
                         or not isinstance(node.value, ast.Attribute)
@@ -1194,7 +1204,7 @@ class Impact:
         if self.parser_lambda_import_calls is None:
             return None
         target_module = path.removesuffix(".py").replace("/", ".")
-        tree = ast.parse(self.sources[path])
+        tree = self.source_tree(path)
         owners = [n for n in tree.body if isinstance(n, ast.ClassDef)
                   and n.name == class_name]
         if len(owners) != 1:
@@ -1237,7 +1247,7 @@ class Impact:
                 if len(imports) == 1:
                     factory_path = imports[0].module.replace(".", "/") + ".py"
                     if factory_path in self.sources:
-                        definition = ast.parse(self.sources[factory_path])
+                        definition = self.source_tree(factory_path)
                         functions = [n for n in definition.body
                                      if isinstance(n, ast.FunctionDef) and n.name == name]
             result = False
@@ -1277,7 +1287,7 @@ class Impact:
         for source_path, text in self.sources.items():
             if field not in text:
                 continue
-            root = tree if source_path == path else ast.parse(text)
+            root = tree if source_path == path else self.source_tree(source_path)
             nodes, parents = [], {}
             pending = deque([root])
             while pending:
@@ -2191,5 +2201,10 @@ class Impact:
         return bool(changed) and all(not line or line.startswith("#") for line in changed)
 
     def select(self, patch):
-        ids = self.select_ids(patch)
+        try:
+            ids = self.select_ids(patch)
+        finally:
+            # Keep the lazy AST cache local to one patch. Holding hundreds of
+            # trees across the batch increases cyclic-GC scan time.
+            self._source_trees.clear()
         return [test for test in self.tests if test["id"] in ids]
