@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!selector.py
+!impact.py
+!impact.json.gz
+!fixture-reads.json
+!LICENSE.sqlglot
