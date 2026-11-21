@@ -453,9 +453,19 @@ class Impact:
             test for group in self.contexts for test in group
         )
         class_path = map_path.with_name("class-uses.json.gz")
-        with gzip.open(class_path, "rt") if class_path.exists() else open("/dev/null") as handle:
-            self.class_uses = ({key: set(ids) for key, ids in json.load(handle).items()}
-                               if class_path.exists() else {})
+        try:
+            with gzip.open(class_path, "rt") as handle:
+                parent_classes = json.load(handle)
+            self.parent_class_map_valid = (
+                isinstance(parent_classes, dict)
+                and all(type(key) is str and isinstance(ids, list)
+                        and ids == sorted(set(ids)) and set(ids) <= self.all_ids
+                        for key, ids in parent_classes.items()))
+        except (OSError, ValueError, TypeError):
+            parent_classes = {}
+            self.parent_class_map_valid = False
+        self.class_uses = ({key: set(ids) for key, ids in parent_classes.items()}
+                           if self.parent_class_map_valid else {})
         import_path = map_path.with_name("class-import-reads.json")
         self.class_import_reads = (set(json.loads(import_path.read_text()))
                                    if import_path.exists() else None)
@@ -1037,7 +1047,7 @@ class Impact:
                         # Class consumers in spawned workers are absent from
                         # the parent trace. A missing or incomplete child map
                         # cannot justify narrowing structural edits.
-                        if self.pool_classes is None:
+                        if self.pool_classes is None or not self.parent_class_map_valid:
                             return self.all_ids
                         if len(edits) == 1 and self.class_uses:
                             try:
@@ -1099,6 +1109,11 @@ class Impact:
                                                     self.class_unprofiled,
                                                     self.by_file.get(old, ()))
                                     continue
+                                # A class instance made before a test may be
+                                # reused without another observed constructor.
+                                if (self.class_import_constructors is None
+                                        or key in self.class_import_constructors):
+                                    return self.all_ids
                                 readers, import_read = self.class_readers(attr)
                                 expression_schema = (attr == "arg_types" and
                                     self.safe_expression_arg_types(old, class_name, before, after))
