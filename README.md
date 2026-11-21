@@ -23,10 +23,11 @@ For a host run, use `python3 selector.py --data "$KIT/sample"`. The official sco
 ## How selection works
 
 - The map combines coverage from the clean suite with coverage collected inside optimizer and executor worker processes. Each submitted worker task carries the current pytest node ID. Tests that launch other children are included conservatively.
-- The selector reconstructs the changed Python source in memory and verifies the diff context. It compares ASTs while preserving declarations, annotations, decorators, function docstrings, and generator status. For body-only changes it selects tests observed in the affected function bodies, source readers, opaque subprocess callers, and tests absent from the profile.
+- The selector reconstructs the changed Python source in memory and verifies the diff context. It compares ASTs while preserving declarations, annotations, decorators, function docstrings, and generator status. For body-only changes it selects tests observed in the affected function bodies, source readers, opaque subprocess callers, and tests absent from the profile. When old statements are replaced line for line without changing local bindings, a narrower statement trace can be used; uncertain edits keep the body selection.
 - On the main and file fallback branches, edits confined to comments or blank lines must preserve the Python AST including type comments. Encoding and shebang changes take the broader selection. Source-reading and subprocess tests still run.
-- Edits to existing fixtures use the tests observed opening the file on the pristine checkout. Collection-time reads and structural file changes use the full suite.
+- Edits to existing fixtures use the tests observed opening the file on the pristine checkout. Reads in shared class or module setup also select other tests in the same scope. Collection-time reads and structural file changes use the full suite.
 - Other structural changes, unrecognized paths, compilation failures, and function bodies with absent or collection-time coverage take the all-tests fallback. The fallback uses longest-processing-time-first packing, testing the actual score for each feasible worker count from one to eight with integer millisecond arithmetic.
+- A separate clean-suite profile observes constructors of SQLGlot dialects, tokenizer/parser/generator classes, and expression nodes, including their base classes. An existing class assignment may use that map only if the old and new values are literal data, every other AST node is unchanged, and a pristine source scan finds no import-time reader of its name. The narrow exception is a fixed-key boolean `Expr.arg_types` schema: the pinned class hook derives `required_args` from it. Its class users, references, reflective tests, tests missing from the class profile, source readers, and subprocess users are all selected. An early import hook records the receiver classes validated by `Expression.error_messages` before or between tests. Schemas of those classes, and direct import-time copies of a class schema, retain the broad fallback. A missing import map also disables the exception.
 
 ## Rebuild the maps
 
@@ -36,9 +37,13 @@ Use Python 3.13, the organizer's [pinned dependencies](requirements.lock), and `
 SKIP_INTEGRATION=0 python tools/profile_suite.py "$SQLGLOT" /tmp/parent.json.gz
 SKIP_INTEGRATION=0 python tools/profile_suite.py "$SQLGLOT" /tmp/pools.json.gz \
   --with-pools --tests tests/test_optimizer.py tests/test_executor.py
-SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_fixtures.py "$SQLGLOT" fixture-reads.json
+SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_fixtures.py "$SQLGLOT" \
+  fixture-reads.json --shared fixture-shared.json
 python tools/build_map.py "$SQLGLOT" impact.json.gz \
   --profile /tmp/parent.json.gz --profile /tmp/pools.json.gz
+SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_classes.py \
+  "$SQLGLOT" "$KIT/sample/tests.json" class-uses.json.gz \
+  --import-output class-import-reads.json
 ```
 
 The compressed map includes pristine source text for diff verification. SQLGlot's [MIT license](LICENSE.sqlglot) ships with the map. Raw profiles and regression labels are outside the Docker build context. The image build uses the organizer's digest-pinned Python 3.13 base and performs no package installation.

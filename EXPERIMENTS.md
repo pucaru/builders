@@ -1,5 +1,47 @@
 # Experiment log
 
+## Integrated class and shared setup selector
+
+The independent class-use map and schema classifier from `class-coverage` were combined with the previously verified shared-fixture attribution and statement selection. The exact combined Dockerfile payload was run in the digest-verified read-only Bubblewrap substitute as UID/GID 65534 with the same two-core, 4 GiB, 64 MiB temporary filesystem and no-network limits used for the previous release. This was not a Docker build. The organizer's scorer reported 296.085 simulated seconds and zero misses on the 30 samples. A separate host run took 2.559 CPU seconds; the local scorer excludes CPU. The previous local release was 322.297 simulated seconds, zero misses.
+
+| Labeled corpus | Integrated simulated s | Misses |
+| --- | ---: | ---: |
+| Official 30 samples | 296.085 | 0 |
+| Fresh statement and shared TPC-H fixture edits | 37.740 | 0 |
+| Fresh class mutations | 48.309 | 0 |
+| Fresh expression schemas (110 failures in CREATE edit) | 42.300 | 0 |
+| Independent final cases | 327.923 | 0 |
+| Independent extended cases | 375.393 | 0 |
+| Independent fixture cases | 4.832 | 0 |
+| Independent dialect cases | 48.309 | 0 |
+
+The prior release costs 42.306 seconds on the independent dialect and class pairs; the additional 6.003 seconds here is a conservative widening for class-field consumers. Hidden-test coverage of dynamic class introspection is still uncertain. The independent labels, including failures, remain outside the Docker image and selector.
+
+## Statement and shared-setup experiment
+
+An independent review of public entries identified two mechanisms worth testing: statement-level impact within otherwise unchanged function bodies, and attribution of fixture reads from class setup to all tests in that class. This branch implements both from the pinned pristine checkout without using another team's code. The shared fixture map comes from a clean run with 1,620 tests passing, one skipped, and 25,440 subtests passing. It identifies 34 paths opened during `setUpClass`, including the TPC-H and TPC-DS inputs in `TestExecutor`. Normal per-method fixture reads stay with the reading test.
+
+| Corpus | Main simulated s | Candidate simulated s | Candidate misses |
+| --- | ---: | ---: | ---: |
+| Official 30 samples | 323.703 | 322.297 | 0 |
+| Independent final cases | 327.923 | 327.923 | 0 |
+| Independent extended cases | 375.393 | 375.393 | 0 |
+| Independent fixture cases | 4.832 | 4.832 | 0 |
+| Independent dialect cases | 42.306 | 42.306 | 0 |
+
+The official local scorer supplied simulated costs. Candidate host CPU was approximately 1.4 seconds for the sample batch, versus approximately 1.0 second for main, measured during separate runs on a shared host. The narrow statement rule affects two sample patches; no existing independently labeled case exercises its narrower path. Do not infer hidden-test safety from these results alone. Docker has not been available for a real image build.
+
+Four further independent mutations were labeled by running the full pinned test suite on each modified checkout, each taking approximately 102–105 seconds. Three replace a statement in `sqlglot/time.py` while preserving its surrounding function: two produced five failing tests each and one produced 49. The fourth alters a TPC-H SQL fixture loaded in executor class setup and produced two failing tests. These labels and logs are kept outside the selector and image under `independent-statements/`.
+
+| Branch | Four-mutation simulated s | Misses | Host CPU s |
+| --- | ---: | ---: | ---: |
+| Previous main, `c07b8fb` | 316.410 | 1 | 0.429 |
+| Statement plus shared setup, `39ea17b` | 37.740 | 0 | 0.459 |
+
+The old selector missed one of the two TPC-H fixture failures because the fixture is opened during `TestExecutor.setUpClass`, once for the whole class. The new clean-suite setup map attributes that read to every test in the class. The three independently labeled statement replacements incurred zero misses under the narrower rule.
+
+The promoted local main commit `f31115b` was run from the exact Dockerfile payload using the digest-verified base filesystem in a read-only Bubblewrap sandbox as UID/GID 65534, with two CPU cores, 4 GiB address-space limit, 64 MiB `/tmp`, and networking blocked. Its output scored 322.297 simulated seconds and zero misses on the official sample. This remains a substitute check, not a successful Docker build or an official practice score; its reported wrapper CPU does not measure all namespaced process CPU.
+
 All simulated scores use the organizer's `score.py`. Miss penalties are included. Host CPU and wall time are for one 30-patch run under Debian Python 3.13.5. They are separate from simulated seconds and vary with host load.
 
 | Branch or experiment | Commit | Official seconds | Misses | Host wall s | Host CPU s |
@@ -104,3 +146,20 @@ A Python audit hook on the clean pinned suite recorded active pytest node IDs wh
 | Fixture-aware | 355.031 | 0 | 375.393 | 0 |
 
 Eleven of the original sixteen all-tests fallbacks disappeared from the public sample. Two additional clean-checkout fixture mutations, in qualify_tables.sql and eliminate_ctes.sql, produced one and zero failing tests respectively. Both selected two tests and incurred zero misses. These were benchmark labels only. The selector uses the pristine file-read observations.
+
+## Isolated class-use experiment
+
+The `class-coverage` branch adds a 344 KiB class-use map from a pristine pinned suite run (1,620 tests and 25,440 subtests passed; one skipped; 110.5 seconds wall on this host). Constructor observations include SQLGlot base classes and class setup use is expanded to all tests of that test class. Its selector retains the full-suite fallback for unproved import-time dependencies, including class values read while other classes are built.
+
+The `tools/measure.py` host run on the 30 samples measured 1.518 seconds wall and 1.483 seconds CPU for this branch, separate from the official 297.491 simulated seconds. The host CPU is not an organizer container measurement.
+
+A second full clean-suite profile installs the hooks before SQLGlot is imported and records the class/MRO of every expression validated by `Expression.error_messages` before or between tests. It passed 1,620 tests and 25,440 subtests in 109.0 seconds wall and identified 95 import-time receiver classes. A one-test coupled coverage check reproduced the original blank coverage context at that method while the hook identified its receiver class. The selector disables schema narrowing without this map, for a target class appearing in it, or if the pinned AST contains an unexpected reader of derived `required_args`. The three class schemas in the sample and independent class-schema evaluation were absent from the import receiver set. Official and independent costs were unchanged by the new guard.
+
+| Variant | Official 30-sample simulated s | Misses | Independent classes | Independent schema mutants |
+| --- | ---: | ---: | ---: | ---: |
+| Previous `c07b8fb` | 323.703 | 0 | 42.306 s / 0 misses | 73.634 s / 0 misses |
+| Class map with fixed-key expression schemas | 297.491 | 0 | 48.309 s / 0 misses | 42.300 s / 0 misses |
+
+Two fresh schema mutations were labeled by the complete pinned suite, separate from the selector and image. `SequenceProperties.arg_types['maxvalue']` becoming required broke no tests. `Create.arg_types['expression']` becoming required broke 110 tests; the selector chose 755 and caught all 110. Two earlier dialect mutations (`TSQL.WEEK_OFFSET` and Snowflake numeric escape table) also had zero selection misses, with 48.306 simulated seconds together.
+
+This experiment started from `c07b8fb` and therefore still misses the later independently labeled shared TPC-H fixture setup mutation (316.410 seconds including one 300-second penalty). The fix for shared fixture setup is on the main branch and must be combined before release. The class-map branch alone is not a final candidate. The 297.491-second number is the organizer's local simulated sample cost; container CPU and hidden-test misses have not been measured. Docker remains unavailable in this environment, so no real image build was run for this branch.

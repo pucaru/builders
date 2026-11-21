@@ -1,2 +1,4 @@
 __pycache__/
 .pytest_cache/
+class-uses.json
+class-uses-new.json.gz

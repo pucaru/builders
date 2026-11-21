@@ -3,5 +3,7 @@
 !selector.py
 !impact.py
 !impact.json.gz
+!class-uses.json.gz
+!class-import-reads.json
 !fixture-reads.json
 !LICENSE.sqlglot
