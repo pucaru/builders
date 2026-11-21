@@ -424,3 +424,9 @@ The Docker context checker found all 18 `COPY` inputs. The copied payload emitte
 ## Fresh scalar regression labels
 
 Two new value-only class-field edits were labeled by running the complete pinned SQLGlot suite on separate pristine checkout copies. Oracle's `LOCKING_READS_SUPPORTED = True` to `False` produced no failing tests in 116.886 host seconds. Snowflake's `TRY_CAST_REQUIRES_STRING = True` to `False` produced one failing test, `TestSnowflake.test_try_cast`, in 118.356 host seconds. The verified selector commit `3b877a0` selected 58 and 408 tests respectively, including that failure. The official scorer reports **16.757 simulated seconds and zero misses** across the two fresh cases. These labels remain outside the selector and Docker image. This experiment adds no selection rule; the official 30-sample checkpoint remains 179.161/0.
+
+## Fresh parser lambda regression labels
+
+Four more parser dispatch edits were labeled with separate complete pinned-suite runs. An Exasol `HASH_SHA256` lambda changed the length literal from 256 to 128 and caused one failure; an Exasol `DATE_TRUNC` lambda changed its `this` argument index from 1 to 0 and caused one failure. Before labels were available, the selector chose 78 tests for each. The official scorer reports **4.146 simulated seconds and zero misses** for each case. Their labeling runs took 106.290 and 103.911 host seconds.
+
+A Snowflake `TRY_TO_BOOLEAN` lambda changed `safe=True` to `safe=False` and caused one failure; a Presto `BITWISE_NOT` lambda changed its argument index from 0 to 1 and caused three failures. Both edits selected the full 1,620-test suite through existing guards, scoring 73.634 simulated seconds together with zero misses. Their labeling runs took 107.794 and 108.447 host seconds. These four new labels remain outside the selector and Docker image. The verified code commit is still `3b877a0`, and the official 30-sample result is still 179.161/0.
