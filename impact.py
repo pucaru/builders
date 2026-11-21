@@ -197,6 +197,13 @@ class Impact:
                         selected.update(self.by_file.get(old, ()))
                         continue
                     if not spans:
+                        if old.startswith("sqlglot/dialects/") and "" not in self.subprocess:
+                            observed = set().union(*(self.contexts[index]
+                                                     for index in set(contexts.values())))
+                            if "" not in observed and observed:
+                                selected.update(observed, self.readers, self.subprocess,
+                                                self.unmapped, self.by_file.get(old, ()))
+                                continue
                         return self.all_ids
                     if self.mode == "pool-file":
                         observed = set().union(*(self.contexts[index]
