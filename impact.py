@@ -390,6 +390,38 @@ def class_lambda_edit(source, patched):
     return key
 
 
+def scalar_literal_lambda_body_edit(before, after):
+    """Require identical operations with only same-typed scalar values changed.
+
+    A lambda body with a new call, attribute lookup, control-flow operation or
+    write can mutate shared state in one test and fail a later test which never
+    calls the lambda. Compare the whole expression, including call targets and
+    argument layout; only numeric and boolean literal values may differ.
+    """
+    changed = False
+
+    def same(left, right):
+        nonlocal changed
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, ast.Constant):
+            if left.kind != right.kind or type(left.value) is not type(right.value):
+                return False
+            if left.value != right.value:
+                if type(left.value) not in (bool, int, float):
+                    return False
+                changed = True
+            return True
+        if isinstance(left, ast.AST):
+            return all(same(getattr(left, field), getattr(right, field))
+                       for field in left._fields)
+        if isinstance(left, list):
+            return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right))
+        return left == right
+
+    return same(before, after) and changed
+
+
 def class_factory_literal_edit(source, patched):
     """Find one changed literal argument in a class dictionary factory call.
 
@@ -1045,7 +1077,7 @@ class Impact:
         return True
 
     def parser_lambda_call_readers(self, path, class_name, field, entry, patched):
-        """Use pristine calls only for a body edit with stable closure layout.
+        """Use pristine calls only for an unchanged body shape and call graph.
 
         The dictionary key, callable arguments and its class construction are
         unchanged by class_lambda_edit. A changed body cannot affect execution
@@ -1053,11 +1085,7 @@ class Impact:
         Retain source/reflective tests and explicit test-table references in
         addition to the clean parent and spawned-worker call profile.
         """
-        if self.lambda_call_uses is None:
-            return None
         source = self.sources[path]
-        if len(source.splitlines()) != len(patched.splitlines()):
-            return None
 
         def target(text):
             tree = ast.parse(text)
@@ -1067,9 +1095,14 @@ class Impact:
                 return None
             entries = []
             for stmt in owners[0].body:
-                if (not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1
-                        or not isinstance(stmt.targets[0], ast.Name)
-                        or stmt.targets[0].id != field or not isinstance(stmt.value, ast.Dict)):
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                    name = stmt.targets[0]
+                elif isinstance(stmt, ast.AnnAssign) and stmt.simple == 1:
+                    name = stmt.target
+                else:
+                    continue
+                if (not isinstance(name, ast.Name) or name.id != field
+                        or not isinstance(stmt.value, ast.Dict)):
                     continue
                 entries.extend(value for key, value in zip(stmt.value.keys, stmt.value.values)
                                if isinstance(key, ast.Constant) and key.value == entry
@@ -1077,8 +1110,10 @@ class Impact:
             return entries[0] if len(entries) == 1 else None
 
         old, new = target(source), target(patched)
-        if old is None or new is None or old.lineno != new.lineno:
-            return None
+        if (old is None or new is None or old.lineno != new.lineno
+                or len(source.splitlines()) != len(patched.splitlines())
+                or not scalar_literal_lambda_body_edit(old.body, new.body)):
+            return self.all_ids
         scoped = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
                   ast.GeneratorExp, ast.NamedExpr, ast.Yield, ast.YieldFrom,
                   ast.Await)
@@ -1086,7 +1121,7 @@ class Impact:
             if any(isinstance(node, scoped)
                    or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                        and node.func.id == "super") for node in ast.walk(body)):
-                return None
+                return self.all_ids
 
         def names(node, context):
             return sorted(child.id for child in ast.walk(node)
@@ -1095,6 +1130,8 @@ class Impact:
                 or names(old.body, (ast.Store, ast.Del))
                 != names(new.body, (ast.Store, ast.Del))
                 or "__class__" in names(old.body, ast.Load)):
+            return self.all_ids
+        if self.lambda_call_uses is None:
             return None
         code_key = (path, old.lineno, class_name + ".<lambda>")
         if code_key not in self.lambda_call_uses:
@@ -1107,21 +1144,19 @@ class Impact:
         # check dictionary membership; none observes a changed body before a
         # call. An actual code-object/closure reader would need more than the
         # call profile and so disables this exception.
+        code_fields = {"__code__", "__closure__", "co_code", "co_consts", "co_freevars"}
         for source_path, text in self.sources.items():
-            if not source_path.startswith("sqlglot/") or not any(
-                    token in text for token in ("__code__", "__closure__", "co_consts",
-                                                "co_code", "co_freevars", "FUNCTIONS")):
+            if not source_path.startswith("sqlglot/") or not (
+                    any(token in text for token in code_fields)
+                    or (field in text and "getattr" in text)):
                 continue
-            tree = ast.parse(text)
-            if any(isinstance(node, ast.Attribute) and node.attr in {
-                    "__code__", "__closure__", "co_code", "co_consts", "co_freevars"}
-                   for node in ast.walk(tree)):
-                return None
-            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                   and node.func.id == "getattr" and len(node.args) >= 2
-                   and isinstance(node.args[1], ast.Constant)
-                   and node.args[1].value == field for node in ast.walk(tree)):
-                return None
+            for node in ast.walk(ast.parse(text)):
+                if (isinstance(node, ast.Attribute) and node.attr in code_fields
+                        or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == "getattr" and len(node.args) >= 2
+                        and isinstance(node.args[1], ast.Constant)
+                        and node.args[1].value == field):
+                    return None
         for test_path, text in self.sources.items():
             if not test_path.startswith("tests/"):
                 continue
@@ -1164,9 +1199,17 @@ class Impact:
                   and n.name == class_name]
         if len(owners) != 1:
             return None
-        fields = [n for n in owners[0].body if isinstance(n, ast.Assign)
-                  and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
-                  and n.targets[0].id == field and isinstance(n.value, ast.Dict)]
+        postponed_annotations = any(
+            isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names)
+            for node in tree.body
+        )
+        fields = [n for n in owners[0].body if (
+                  (isinstance(n, ast.Assign) and len(n.targets) == 1
+                   and isinstance(n.targets[0], ast.Name) and n.targets[0].id == field)
+                  or (postponed_annotations and isinstance(n, ast.AnnAssign) and n.simple == 1
+                      and isinstance(n.target, ast.Name) and n.target.id == field))
+                  and isinstance(n.value, ast.Dict)]
         if len(fields) != 1:
             return None
         lambdas = [v for k, v in zip(fields[0].value.keys, fields[0].value.values)
@@ -1790,13 +1833,13 @@ class Impact:
         dict_reads = [node for node in ast.walk(metaclass)
                       if isinstance(node, ast.Attribute) and node.attr == "__dict__"
                       and isinstance(node.ctx, ast.Load)]
+        metaclass_parents = {child: parent for parent in ast.walk(metaclass)
+                             for child in ast.iter_child_nodes(parent)}
         for node in dict_reads:
             # Every class-dictionary read is a fixed-key `.get` or derives a
             # tokenizer/parser/generator class via the same fixed-key lookup.
-            parents = {child: parent for parent in ast.walk(metaclass)
-                       for child in ast.iter_child_nodes(parent)}
-            method = parents.get(node)
-            call = parents.get(method)
+            method = metaclass_parents.get(node)
+            call = metaclass_parents.get(method)
             if (not isinstance(method, ast.Attribute) or method.attr != "get"
                     or not isinstance(call, ast.Call) or call.func is not method
                     or not call.args or not isinstance(call.args[0], ast.Constant)
@@ -1804,7 +1847,8 @@ class Impact:
                 return False
         indirect = set()
         for source_path, source in self.sources.items():
-            if source_path.startswith("sqlglot/dialects/"):
+            if (source_path.startswith("sqlglot/dialects/")
+                    and ("__getattribute__" in source or "__getattr__" in source)):
                 for owner in ast.walk(ast.parse(source)):
                     if (isinstance(owner, ast.ClassDef)
                             and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -1993,12 +2037,12 @@ class Impact:
                                 if self.safe_parser_dispatch_lambda(old, class_name, attr):
                                     module = old.removesuffix(".py").replace("/", ".")
                                     key = module + ":" + class_name
+                                    call_readers = self.parser_lambda_call_readers(
+                                        old, class_name, attr, entry, patched)
+                                    if call_readers is self.all_ids:
+                                        return self.all_ids
                                     readers = self.parser_lambda_readers(old, class_name, attr, entry)
                                     if readers is not None:
-                                        call_readers = self.parser_lambda_call_readers(
-                                            old, class_name, attr, entry, patched)
-                                        if call_readers is self.all_ids:
-                                            return self.all_ids
                                         if call_readers is not None:
                                             readers = call_readers
                                         selected.update(self.class_uses[key], readers, self.readers,

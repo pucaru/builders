@@ -1,4 +1,4 @@
-"""Check that unsupported lambda shapes retain the earlier broad selection."""
+"""Check that unsupported lambda bodies select the full pinned suite."""
 import difflib
 import gzip
 import json
@@ -33,17 +33,32 @@ def main():
     broad = impact.select_ids(patch)
     assert fast < broad and len(fast) < len(broad)
 
-    # With a valid map, changed closure/scope shapes still use old readers.
+    # New operations, closure changes and nested scopes may mutate state read
+    # by later tests that never call the edited lambda.
     impact = Impact(manifest, root / "impact.json.gz", "pool-noop")
     for expression in ("unknown(args, 0),", "super(),", "__class__,",
                        "(x for x in args),"):
         other = original.replace(anchor, "this=" + expression, 1)
         candidate = patch_for(path, original, other)
-        selected = impact.select_ids(candidate)
+        assert impact.select_ids(candidate) == impact.all_ids, expression
         impact.lambda_call_uses = None
-        expected = impact.select_ids(candidate)
-        assert selected == expected, expression
+        assert impact.select_ids(candidate) == impact.all_ids, expression
         impact = Impact(manifest, root / "impact.json.gz", "pool-noop")
+
+    bq_path = "sqlglot/parsers/bigquery.py"
+    bq_old = impact.sources[bq_path]
+    bq_anchor = '"LENGTH": lambda args: exp.Length(this=seq_get(args, 0), binary=True),'
+    assert bq_old.count(bq_anchor) == 1
+    adversarial = bq_old.replace(bq_anchor,
+        '"LENGTH": lambda args: exp.Length.arg_types.clear() or seq_get(args, 0),', 1)
+    unsafe_patch = patch_for(bq_path, bq_old, adversarial)
+    assert impact.select_ids(unsafe_patch) == impact.all_ids
+    impact.lambda_call_uses = None
+    assert impact.select_ids(unsafe_patch) == impact.all_ids
+    impact = Impact(manifest, root / "impact.json.gz", "pool-noop")
+    benign = bq_old.replace(bq_anchor,
+        '"LENGTH": lambda args: exp.Length(this=seq_get(args, 1), binary=True),', 1)
+    assert len(impact.select_ids(patch_for(bq_path, bq_old, benign))) < len(impact.all_ids)
 
     target = (path, 110, "DremioParser.<lambda>")
     impact.lambda_import_uses.add(target)
