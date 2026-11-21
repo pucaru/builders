@@ -80,6 +80,8 @@ SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_lambda_imports.py \
 SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_lambda_key_calls.py \
   "$SQLGLOT" "$KIT/sample/tests.json" parser-lambda-key-calls.json.gz \
   --impact-map impact.json.gz
+python tools/build_parser_lambda_reader_index.py "$KIT/sample/tests.json" \
+  parser-lambda-reader-index.json.gz --map impact.json.gz
 ```
 
 The compressed map includes pristine source text for diff verification. Both pool profiles reject a clean run unless every submitted task has a matching child record. The selector checks map consistency and uses the full suite for structural edits if the constructor map is missing. SQLGlot's [MIT license](LICENSE.sqlglot) ships with the map. Raw profiles and regression labels are outside the Docker build context. The image build uses the organizer's digest-pinned Python 3.13 base and performs no package installation.

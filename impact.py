@@ -9,6 +9,7 @@ import re
 import types
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+PARSER_LAMBDA_READER_INDEX_VERSION = 1
 
 
 def sections(patch):
@@ -642,6 +643,17 @@ class Impact:
                                    if self.lambda_call_uses is not None else None)
         self.lambda_shared_uses = (set(map(tuple, lambda_keys["shared_calls"]))
                                    if self.lambda_call_uses is not None else None)
+        reader_index_path = map_path.with_name("parser-lambda-reader-index.json.gz")
+        try:
+            with gzip.open(reader_index_path, "rb") as handle:
+                reader_index = json.load(handle)
+        except (OSError, EOFError, ValueError):
+            reader_index = None
+        self.parser_lambda_reader_index = (
+            {tuple(row[:4]): None if row[4] is None else set(row[4])
+             for row in reader_index["entries"]}
+            if self.valid_parser_lambda_reader_index(reader_index, map_path) else None
+        )
         numeric_path = map_path.with_name("numeric-key-uses.json.gz")
         try:
             with gzip.open(numeric_path, "rb") as handle:
@@ -810,6 +822,38 @@ class Impact:
                     or list(map(tuple, calls)) != sorted(set(map(tuple, calls)))):
                 return False
         return True
+
+    def valid_parser_lambda_reader_index(self, index, map_path):
+        """Bind pristine parser-table analysis to its source, import map and tests."""
+        import_path = map_path.with_name("parser-lambda-import-calls.json")
+        if (not isinstance(index, dict)
+                or set(index) != {"version", "impact_sha256", "import_calls_sha256",
+                                  "ids_sha256", "entries_sha256", "entries"}
+                or index["version"] != PARSER_LAMBDA_READER_INDEX_VERSION
+                or index["impact_sha256"] != hashlib.sha256(map_path.read_bytes()).hexdigest()
+                or index["import_calls_sha256"] != hashlib.sha256(
+                    import_path.read_bytes()).hexdigest()
+                or index["ids_sha256"] != hashlib.sha256(
+                    json.dumps(sorted(self.all_ids), separators=(",", ":")).encode()
+                ).hexdigest()
+                or not isinstance(index["entries"], list)
+                or index["entries_sha256"] != hashlib.sha256(
+                    json.dumps(index["entries"], separators=(",", ":")).encode()
+                ).hexdigest()):
+            return False
+        keys = []
+        for row in index["entries"]:
+            if (not isinstance(row, list) or len(row) != 5
+                    or type(row[0]) is not str or not row[0].startswith("sqlglot/parsers/")
+                    or row[0] not in self.sources
+                    or any(type(value) is not str for value in row[1:4])
+                    or (row[4] is not None and (
+                        not isinstance(row[4], list) or row[4] != sorted(set(row[4]))
+                        or any(type(nodeid) is not str for nodeid in row[4])
+                        or not set(row[4]) <= self.all_ids))):
+                return False
+            keys.append(tuple(row[:4]))
+        return keys == sorted(set(keys))
 
     def class_readers(self, name):
         """Use pristine references to include direct class-data readers.
@@ -1203,6 +1247,10 @@ class Impact:
         """
         if self.parser_lambda_import_calls is None:
             return None
+        index_key = (path, class_name, field, entry)
+        if self.parser_lambda_reader_index is not None and index_key in self.parser_lambda_reader_index:
+            readers = self.parser_lambda_reader_index[index_key]
+            return None if readers is None else set(readers)
         target_module = path.removesuffix(".py").replace("/", ".")
         tree = self.source_tree(path)
         owners = [n for n in tree.body if isinstance(n, ast.ClassDef)

@@ -8,6 +8,7 @@
 !class-import-constructors.json
 !parser-lambda-import-calls.json
 !parser-lambda-key-calls.json.gz
+!parser-lambda-reader-index.json.gz
 !pool-classes.json.gz
 !numeric-key-uses.json.gz
 !scalar-reads.json.gz
