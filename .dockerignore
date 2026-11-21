@@ -5,6 +5,7 @@
 !impact.json.gz
 !class-uses.json.gz
 !class-import-reads.json
+!class-import-constructors.json
 !fixture-reads.json
 !fixture-shared.json
 !LICENSE.sqlglot

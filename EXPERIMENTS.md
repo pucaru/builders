@@ -1,5 +1,9 @@
 # Experiment log
 
+## Statement relocation safety
+
+The statement-level fast path now accepts only an adjacent, single-line, same-kind replacement with unchanged name loads and bindings. Insertions, deletions, relocations, changed source headers, and mixed comment/code changes fall back to broader selection. A new full-suite label for an early return inserted in `Generator.property_sql` found 41 failing tests. The previous equal-line-count rule selected six tests, omitted 40 failures, and scored 302.495 seconds including one 300-second miss. The guarded selector scores 4.738 seconds with zero misses on that patch. The official 30-sample result remains 267.140 seconds with zero misses; the existing four fresh statement labels remain 37.740/0. Synthetic header, comment, and relocation fallback checks pass. The label and its test output are outside the Docker payload.
+
 ## Integrated class and shared setup selector
 
 The independent class-use map and schema classifier from `class-coverage` were combined with the previously verified shared-fixture attribution and statement selection. The exact combined Dockerfile payload was run in the digest-verified read-only Bubblewrap substitute as UID/GID 65534 with the same two-core, 4 GiB, 64 MiB temporary filesystem and no-network limits used for the previous release. This was not a Docker build. The organizer's scorer reported 296.085 simulated seconds and zero misses on the 30 samples. A separate host run took 2.559 CPU seconds; the local scorer excludes CPU. The previous local release was 322.297 simulated seconds, zero misses.
@@ -163,3 +167,23 @@ A second full clean-suite profile installs the hooks before SQLGlot is imported 
 Two fresh schema mutations were labeled by the complete pinned suite, separate from the selector and image. `SequenceProperties.arg_types['maxvalue']` becoming required broke no tests. `Create.arg_types['expression']` becoming required broke 110 tests; the selector chose 755 and caught all 110. Two earlier dialect mutations (`TSQL.WEEK_OFFSET` and Snowflake numeric escape table) also had zero selection misses, with 48.306 simulated seconds together.
 
 This experiment started from `c07b8fb` and therefore still misses the later independently labeled shared TPC-H fixture setup mutation (316.410 seconds including one 300-second penalty). The fix for shared fixture setup is on the main branch and must be combined before release. The class-map branch alone is not a final candidate. The 297.491-second number is the organizer's local simulated sample cost; container CPU and hidden-test misses have not been measured. Docker remains unavailable in this environment, so no real image build was run for this branch.
+
+## Runtime class-table dependency experiment
+
+This isolated branch started from local main `dfcd070`, including the shared fixture fix. One additional full pinned suite profile recorded receiver classes constructed outside pytest test contexts: 1,620 tests and 25,440 subtests passed, one skipped, 126.53 seconds wall. The 114 class keys are stored in `class-import-constructors.json`. The branch recognizes a sole lambda-body edit in a direct parser subclass's `FUNCTIONS` dispatch dictionary and same-key literal-value changes to a nested dialect Tokenizer's `NUMERIC_ESCAPES` dictionary. All other AST differences and unexpected source shapes retain the existing broad fallback. Both exceptions use only pristine SQLGlot source and class observations. No regression labels enter the selector or Docker image.
+
+| Variant | Official 30-sample simulated s | Missed patches | Host wall s | Host CPU s |
+| --- | ---: | ---: | ---: | ---: |
+| Main `dfcd070` | 296.085 | 0 | 2.572 | 2.559 |
+| Parser dispatch lambda only | 286.804 | 0 | 3.574 | 3.518 |
+| Parser lambda plus numeric values | 267.140 | 0 | 3.375 | 3.370 |
+
+Two fresh lambda-body mutations were labeled by separate complete pinned suite runs: Dremio `REGEXP_SPLIT`'s `limit` argument and Exasol `BIT_NOT`'s argument index. Each caused one failing test. The branch selected both, costing 55.028 simulated seconds versus main's 73.634, with zero misses. Two independent numeric value changes in BigQuery and Snowflake were also labeled by complete runs; neither caused a test failure. They cost 33.718 seconds together versus main's 73.634, with zero misses. A third independent BigQuery hex escape value change caused two failing tests in a separate 110.706-second complete suite run. The branch selected both at 16.565 simulated seconds versus main's 36.817, again with zero misses.
+
+The branch retained zero misses on the prior extended, final, class-schema, class, fixture, and quiet independent corpora (costs 375.393, 327.923, 42.300, 48.309, 4.832, and 299.994 simulated seconds respectively). The numeric exception does not include generic `NUMERIC_ESCAPES` read contexts because those are shared by nearly all tokenizers; the pinned generator reads only table truthiness and key membership, the metaclass reads only keys, and the runtime tokenization read is covered by receiver construction. Direct test-source references, reflective tests, source readers, opaque subprocess callers, and class-unprofiled tests remain selected. This classification can miss unobserved dynamic access to a value without constructing its tokenizer; the independent labels constrain but cannot eliminate that risk.
+
+Two structural guard checks changed a numeric escape dictionary key and a parser lambda argument list separately. Both selected the entire 1,620-test suite, as intended.
+
+No real Docker image build was available for this branch. The exact Dockerfile payload and `.dockerignore` include the new constructor-import map; release integration must check the actual build context and container limits.
+
+On integration, direct `__init__`/`__new__` overrides in an eligible parser or tokenizer/dialect class were excluded, since the pristine receiver profile wraps the inherited base constructor. This guard preserved 267.140 simulated seconds and zero misses on the official sample, 55.028/0 on the two failing lambda labels, and 16.565/0 on the failing numeric label. A build-context preflight found all nine Docker `COPY` inputs. The exact payload ran as UID/GID 65534 in the digest-verified read-only Bubblewrap substitute with two CPUs, 4 GiB address-space cap, 64 MiB `/tmp`, and denied socket calls; its output again scored 267.140/0. The substitute is not a real Docker build, and its wrapper CPU reading excludes namespaced child CPU.

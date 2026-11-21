@@ -25,6 +25,7 @@ class ClassUse:
         self.used = defaultdict(set)
         self.setup = defaultdict(set)
         self.import_error_classes = set()
+        self.import_constructed_classes = set()
 
     @staticmethod
     def keys(value):
@@ -35,6 +36,7 @@ class ClassUse:
 
     def record(self, value):
         if not self.current:
+            self.import_constructed_classes.update(self.keys(value))
             return
         for key in self.keys(value):
             self.used[key].add(self.current)
@@ -124,6 +126,7 @@ def main():
     ap.add_argument("tests_json", type=Path)
     ap.add_argument("output", type=Path)
     ap.add_argument("--import-output", type=Path)
+    ap.add_argument("--constructor-import-output", type=Path)
     ap.add_argument("--tests", nargs="+", default=["tests"])
     ap.add_argument("--tb", default="no")
     args = ap.parse_args()
@@ -131,6 +134,8 @@ def main():
     tests_json = args.tests_json.resolve()
     output = args.output.resolve()
     import_output = args.import_output.resolve() if args.import_output is not None else None
+    constructor_import_output = (args.constructor_import_output.resolve()
+                                 if args.constructor_import_output is not None else None)
     tests = json.loads(tests_json.read_text())["tests"]
     ids = {t["id"] for t in tests}
     by_scope = defaultdict(set)
@@ -162,6 +167,8 @@ def main():
         output.write_bytes(payload)
     if import_output is not None:
         import_output.write_text(json.dumps(sorted(plugin.import_error_classes)) + "\n")
+    if constructor_import_output is not None:
+        constructor_import_output.write_text(json.dumps(sorted(plugin.import_constructed_classes)) + "\n")
     return 0
 
 

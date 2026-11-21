@@ -7,6 +7,7 @@ The selector assigns SQLGlot tests to up to eight workers. It takes independent 
 Download the [official sample kit](https://www.joinbuilders.org/buildathon/tracks/blast-radius/files/blast-radius-sample.tar.gz) into its own directory. From this repository, with `KIT` set to its absolute path:
 
 ```sh
+python3 tools/check_docker_context.py
 docker build --platform linux/amd64 -t blast-radius-entry .
 docker run --rm --platform linux/amd64 --network none --cpus 2 \
   --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
@@ -28,6 +29,7 @@ For a host run, use `python3 selector.py --data "$KIT/sample"`. The official sco
 - Edits to existing fixtures use the tests observed opening the file on the pristine checkout. Reads in shared class or module setup also select other tests in the same scope. Collection-time reads and structural file changes use the full suite.
 - Other structural changes, unrecognized paths, compilation failures, and function bodies with absent or collection-time coverage take the all-tests fallback. The fallback uses longest-processing-time-first packing, testing the actual score for each feasible worker count from one to eight with integer millisecond arithmetic.
 - A separate clean-suite profile observes constructors of SQLGlot dialects, tokenizer/parser/generator classes, and expression nodes, including their base classes. An existing class assignment may use that map only if the old and new values are literal data, every other AST node is unchanged, and a pristine source scan finds no import-time reader of its name. The narrow exception is a fixed-key boolean `Expr.arg_types` schema: the pinned class hook derives `required_args` from it. Its class users, references, reflective tests, tests missing from the class profile, source readers, and subprocess users are all selected. An early import hook records the receiver classes validated by `Expression.error_messages` before or between tests. Schemas of those classes, and direct import-time copies of a class schema, retain the broad fallback. A missing import map also disables the exception.
+- The clean class profile separately records classes constructed outside test contexts. A sole lambda-body edit within a direct `Parser.FUNCTIONS` subclass dispatch table selects that parser's class users and generic table readers after proving no subclass hook or direct table alias is present. A same-key, value-only change to a nested dialect Tokenizer's `NUMERIC_ESCAPES` selects the tokenizer and dialect users after checking that the pinned metaclass and generator inspect keys or truthiness only. Changed keys, other class shapes, unexpected read sites, absent maps, and multi-file changes retain broad selection.
 
 ## Rebuild the maps
 
@@ -43,7 +45,8 @@ python tools/build_map.py "$SQLGLOT" impact.json.gz \
   --profile /tmp/parent.json.gz --profile /tmp/pools.json.gz
 SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_classes.py \
   "$SQLGLOT" "$KIT/sample/tests.json" class-uses.json.gz \
-  --import-output class-import-reads.json
+  --import-output class-import-reads.json \
+  --constructor-import-output class-import-constructors.json
 ```
 
 The compressed map includes pristine source text for diff verification. SQLGlot's [MIT license](LICENSE.sqlglot) ships with the map. Raw profiles and regression labels are outside the Docker build context. The image build uses the organizer's digest-pinned Python 3.13 base and performs no package installation.

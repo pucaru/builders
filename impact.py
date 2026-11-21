@@ -119,57 +119,111 @@ def changed_bodies(source, patched):
 
 
 def replacement_statements(source, patched, hunk):
-    """Find simple old statements replaced line-for-line by this patch.
+    """Return old statement lines only for adjacent, in-place replacements.
 
-    An insertion, deletion, or changed compound header needs the wider
-    function-level selection. The diff has already been applied and checked.
+Equal numbers of additions and removals do not establish a replacement:
+an inserted early return and a deleted late return can change every call.
+Limit this optimization to a one-line statement replaced immediately by
+another one-line statement of the same kind. All other shapes use the
+existing whole-function coverage fallback.
     """
-    tree = ast.parse(source)
-    new_tree = ast.parse(patched)
-    # A new local binding can change an earlier read into UnboundLocalError,
-    # even when control flow never reaches the edited assignment.
-    def bindings(t):
-        return sorted((type(n.ctx).__name__, n.id) for n in ast.walk(t)
-                      if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)))
-    if bindings(tree) != bindings(new_tree):
+    old_tree, new_tree = ast.parse(source), ast.parse(patched)
+
+    def bindings(tree):
+        return sorted((type(node.ctx).__name__, node.id) for node in ast.walk(tree)
+                      if isinstance(node, ast.Name)
+                      and isinstance(node.ctx, (ast.Store, ast.Del)))
+
+    if bindings(old_tree) != bindings(new_tree):
         return None
-    changed = []
-    old_line = None
-    removed = added = 0
-    for raw in hunk:
-        match = HUNK.match(raw) if raw.startswith("@@") else None
-        if match:
-            if removed != added:
-                return None
-            old_line = int(match[1])
-            removed = added = 0
-        elif old_line is not None:
-            if raw.startswith("\\ No newline"):
-                continue
-            if raw.startswith(" "):
-                old_line += 1
-            elif raw.startswith("-"):
-                removed += 1
-                changed.append(old_line)
-                old_line += 1
-            elif raw.startswith("+"):
-                added += 1
-    if removed != added or not changed:
+
+    def loads(tree):
+        return sorted(node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+                      and isinstance(node.ctx, ast.Load))
+
+    # A new free name such as __class__ can change closure construction even
+    # if its statement is never reached by a test.
+    if loads(old_tree) != loads(new_tree):
         return None
+
     allowed = (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign,
                ast.Return, ast.Raise, ast.Assert, ast.Delete,
                ast.Import, ast.ImportFrom)
-    spans = set()
-    for line in changed:
+
+    def statement(tree, lineno):
         candidates = [node for node in ast.walk(tree) if isinstance(node, ast.stmt)
-                      and hasattr(node, "lineno") and node.lineno <= line <= node.end_lineno]
+                      and getattr(node, "lineno", -1) <= lineno <= getattr(node, "end_lineno", -1)]
         if not candidates:
             return None
-        node = min(candidates, key=lambda n: (n.end_lineno - n.lineno, -n.lineno))
-        if not isinstance(node, allowed):
+        node = min(candidates, key=lambda item: (item.end_lineno - item.lineno, -item.lineno))
+        return node if isinstance(node, allowed) and node.lineno == node.end_lineno == lineno else None
+
+    pairs = []
+    removed = []
+    added = []
+    old_line = new_line = None
+
+    def flush():
+        if not removed and not added:
+            return True
+        if len(removed) != 1 or len(added) != 1:
+            return False
+        before = statement(old_tree, removed[0])
+        after = statement(new_tree, added[0])
+        if before is None or after is None or type(before) is not type(after):
+            return False
+        pairs.append((removed[0], removed[0]))
+        removed.clear()
+        added.clear()
+        return True
+
+    for raw in hunk:
+        match = HUNK.match(raw) if raw.startswith("@@") else None
+        if match:
+            if not flush():
+                return None
+            old_line, new_line = int(match[1]), int(match[3])
+            continue
+        if old_line is None or raw.startswith("\\ No newline"):
+            continue
+        if raw.startswith(" "):
+            if not flush():
+                return None
+            old_line += 1
+            new_line += 1
+        elif raw.startswith("-"):
+            if added:
+                return None
+            removed.append(old_line)
+            old_line += 1
+        elif raw.startswith("+"):
+            if not removed:
+                return None
+            added.append(new_line)
+            new_line += 1
+        else:
             return None
-        spans.add((node.lineno, node.end_lineno))
-    return sorted(spans)
+    return pairs if flush() and pairs else None
+
+
+def changed_comment_text(hunk):
+    """Keep mixed code/comment edits on the full-suite fallback.
+
+This also catches inline comments and shebangs. A hash inside a string may
+occasionally widen the selection, which is safe under the miss penalty.
+    """
+    return any("#" in raw for raw in hunk if raw.startswith(("+", "-"))
+               and not raw.startswith(("+++ ", "--- ")))
+
+
+def changed_source_header(source, patched):
+    """A changed encoding declaration or shebang is observable outside ASTs."""
+    old = source.splitlines()[:2]
+    new = patched.splitlines()[:2]
+    if old == new:
+        return False
+    signature = re.compile(r"^#!|coding[:=]\s*[-\w.]+")
+    return any(signature.search(line) for line in old + new)
 
 
 def class_literal_edit(source, patched):
@@ -239,6 +293,60 @@ def class_literal_edit(source, patched):
     return key, av, bv
 
 
+def class_lambda_edit(source, patched):
+    """Find one changed lambda body stored directly in an existing class dict.
+
+    Replacing both bodies by the same sentinel must make the entire module AST
+    identical. In particular, this excludes changed dict keys, lambda defaults,
+    decorators and any import-time expression around the lambda.
+    """
+    before, after = ast.parse(source, type_comments=True), ast.parse(patched, type_comments=True)
+
+    def lambdas(tree):
+        found = {}
+
+        def classes(body, prefix):
+            for node in body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                qual = prefix + node.name
+                for stmt in node.body:
+                    if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                            and isinstance(stmt.targets[0], ast.Name)):
+                        field, value = stmt.targets[0].id, stmt.value
+                    elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                        field, value = stmt.target.id, stmt.value
+                    else:
+                        continue
+                    if not isinstance(value, ast.Dict):
+                        continue
+                    for key, item in zip(value.keys, value.values):
+                        if (isinstance(key, ast.Constant) and type(key.value) is str
+                                and isinstance(item, ast.Lambda)):
+                            found.setdefault((qual, field, key.value), []).append(item)
+                classes(node.body, qual + ".")
+
+        classes(tree.body, "")
+        return found
+
+    old, new = lambdas(before), lambdas(after)
+    choices = []
+    for key in old.keys() & new.keys():
+        if len(old[key]) != 1 or len(new[key]) != 1:
+            continue
+        a, b = old[key][0], new[key][0]
+        if ast.dump(a.body, include_attributes=False) != ast.dump(b.body, include_attributes=False):
+            choices.append((key, a, b))
+    if len(choices) != 1:
+        return None
+    key, a, b = choices[0]
+    a.body = ast.Constant(value="__blast_class_lambda_body__")
+    b.body = ast.Constant(value="__blast_class_lambda_body__")
+    if ast.dump(before, include_attributes=False) != ast.dump(after, include_attributes=False):
+        return None
+    return key
+
+
 class Impact:
     def __init__(self, tests, map_path, mode):
         with gzip.open(map_path, "rt") as handle:
@@ -270,6 +378,9 @@ class Impact:
         import_path = map_path.with_name("class-import-reads.json")
         self.class_import_reads = (set(json.loads(import_path.read_text()))
                                    if import_path.exists() else None)
+        constructor_path = map_path.with_name("class-import-constructors.json")
+        self.class_import_constructors = (set(json.loads(constructor_path.read_text()))
+                                          if constructor_path.exists() else None)
         self.class_unprofiled = self.all_ids - set().union(
             *(set(ids) for ids in self.class_uses.values())) if self.class_uses else set()
         self.reflective_tests = set()
@@ -406,13 +517,166 @@ class Impact:
                 return False
         return True
 
+    def safe_parser_dispatch_lambda(self, path, class_name, field):
+        """Admit one runtime parser dispatch body after proving its class shape.
+
+        Python creates a lambda object in the class body but does not execute
+        that body's expressions. Parser has no class construction hook, and
+        the pristine suite's import phase did not instantiate this receiver.
+        An exact reference to its table elsewhere may copy/call the function
+        without a Parser receiver, so leave those edits to the broad path.
+        """
+        if (field != "FUNCTIONS" or not path.startswith("sqlglot/parsers/")
+                or self.class_import_constructors is None):
+            return False
+        module = path.removesuffix(".py").replace("/", ".")
+        key = module + ":" + class_name
+        if key in self.class_import_constructors or key not in self.class_uses:
+            return False
+        source = ast.parse(self.sources[path])
+        owners = [node for node in source.body if isinstance(node, ast.ClassDef)
+                  and node.name == class_name]
+        if len(owners) != 1:
+            return False
+        owner = owners[0]
+        if (owner.decorator_list or owner.keywords or len(owner.bases) != 1
+                or not isinstance(owner.bases[0], ast.Attribute)
+                or not isinstance(owner.bases[0].value, ast.Name)
+                or (owner.bases[0].value.id, owner.bases[0].attr) != ("parser", "Parser")
+                or any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and node.name in {"__init__", "__new__"} for node in owner.body)):
+            return False
+        parser = ast.parse(self.sources["sqlglot/parser.py"])
+        roots = [node for node in parser.body if isinstance(node, ast.ClassDef)
+                 and node.name == "Parser"]
+        if (len(roots) != 1 or roots[0].bases or roots[0].keywords
+                or roots[0].decorator_list or any(
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "__init_subclass__" for node in roots[0].body)):
+            return False
+        # Exclude direct table aliases and calls outside the target class.
+        # The dialect's class binding (Parser = DremioParser) is still safe:
+        # runtime uses of that class are captured by constructor profiling.
+        direct = class_name + "." + field
+        if any(direct in text for text in self.sources.values()):
+            return False
+        return True
+
+    def safe_numeric_escape_values(self, path, class_name, before, after):
+        """Narrow fixed-key numeric escape edits after verifying import behavior.
+
+        The pinned dialect metaclass examines only the keys while constructing
+        derived escape tables. Values flow to runtime Tokenizer instances. This
+        condition fails closed if that metaclass or any SQLGlot read site changes.
+        """
+        if (self.class_import_constructors is None or not path.startswith("sqlglot/dialects/")
+                or not class_name.endswith(".Tokenizer") or not isinstance(before, dict)
+                or not isinstance(after, dict) or before.keys() != after.keys()
+                or not all(type(k) is str and type(v) is tuple and len(v) == 4
+                           and all(type(x) is int for x in v) for k, v in before.items())
+                or not all(type(v) is tuple and len(v) == 4
+                           and all(type(x) is int for x in v) for v in after.values())):
+            return False
+        module = path.removesuffix(".py").replace("/", ".")
+        token_key = module + ":" + class_name
+        parent_key = module + ":" + class_name.removesuffix(".Tokenizer")
+        if (token_key not in self.class_uses or parent_key not in self.class_uses
+                or token_key in self.class_import_constructors
+                or parent_key in self.class_import_constructors):
+            return False
+        source = ast.parse(self.sources[path])
+        parent_name = class_name.removesuffix(".Tokenizer")
+        parents = [node for node in source.body if isinstance(node, ast.ClassDef)
+                   and node.name == parent_name]
+        if (len(parents) != 1 or len(parents[0].bases) != 1
+                or parents[0].decorator_list or parents[0].keywords) or not (
+                isinstance(parents[0].bases[0], ast.Name)
+                and parents[0].bases[0].id == "Dialect"):
+            return False
+        tokens = [node for node in parents[0].body if isinstance(node, ast.ClassDef)
+                  and node.name == "Tokenizer"]
+        if (len(tokens) != 1 or len(tokens[0].bases) != 1
+                or not isinstance(tokens[0].bases[0], ast.Attribute)
+                or not isinstance(tokens[0].bases[0].value, ast.Name)
+                or (tokens[0].bases[0].value.id, tokens[0].bases[0].attr)
+                != ("tokens", "Tokenizer") or tokens[0].decorator_list
+                or tokens[0].keywords or any(
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name in {"__init__", "__new__"}
+                    for node in (*parents[0].body, *tokens[0].body))):
+            return False
+        core_reads = {}
+        for source_path, text in self.sources.items():
+            if not source_path.startswith("sqlglot/") or "NUMERIC_ESCAPES" not in text:
+                continue
+            tree = ast.parse(text)
+            reads = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+                     and n.attr == "NUMERIC_ESCAPES" and isinstance(n.ctx, ast.Load)]
+            if reads:
+                core_reads[source_path] = len(reads)
+        if core_reads != {"sqlglot/dialects/dialect.py": 1,
+                          "sqlglot/generator.py": 2,
+                          "sqlglot/tokens.py": 1}:
+            return False
+        generator = ast.parse(self.sources["sqlglot/generator.py"])
+        ancestors = {child: node for node in ast.walk(generator)
+                     for child in ast.iter_child_nodes(node)}
+        generator_reads = [node for node in ast.walk(generator)
+                           if isinstance(node, ast.Attribute)
+                           and node.attr == "NUMERIC_ESCAPES" and isinstance(node.ctx, ast.Load)]
+        # A generator only tests whether the table is nonempty or contains
+        # the fixed 'x' key; a value-only edit cannot change either condition.
+        read_uses = [ancestors[node] for node in generator_reads]
+        if (len(read_uses) != 2 or not any(
+                isinstance(use, ast.BoolOp) and isinstance(use.op, ast.Or)
+                and use.values[0] is generator_reads[i]
+                for i, use in enumerate(read_uses)) or not any(
+                    isinstance(use, ast.Compare) and len(use.ops) == 1
+                    and isinstance(use.ops[0], ast.In)
+                    and isinstance(use.left, ast.Constant) and use.left.value == "x"
+                    and use.comparators == [generator_reads[i]]
+                    for i, use in enumerate(read_uses))):
+            return False
+        dialect = ast.parse(self.sources["sqlglot/dialects/dialect.py"])
+        meta = next((n for n in dialect.body if isinstance(n, ast.ClassDef)
+                     and n.name == "_Dialect"), None)
+        method = next((n for n in meta.body if isinstance(n, ast.FunctionDef)
+                       and n.name == "__new__"), None) if meta else None
+        if method is None:
+            return False
+        assignments = [n for n in ast.walk(method) if isinstance(n, ast.Assign)
+                       and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                       and n.targets[0].id == "numeric_escapes"]
+        if (len(assignments) != 1 or not isinstance(assignments[0].value, ast.Attribute)
+                or assignments[0].value.attr != "NUMERIC_ESCAPES"):
+            return False
+        references = [n for n in ast.walk(method) if isinstance(n, ast.Name)
+                      and n.id == "numeric_escapes" and isinstance(n.ctx, ast.Load)]
+        comparisons = [n for n in ast.walk(method) if isinstance(n, ast.Compare)
+                       and len(n.ops) == 1 and isinstance(n.ops[0], ast.In)
+                       and isinstance(n.left, ast.Constant) and type(n.left.value) is str
+                       and len(n.comparators) == 1 and isinstance(n.comparators[0], ast.Name)
+                       and n.comparators[0].id == "numeric_escapes"]
+        if len(references) != 3 or len(comparisons) != 3 or {
+                n.left.value for n in comparisons} != {"x", "0", "u"}:
+            return False
+        hook = ast.parse(self.sources["sqlglot/tokens.py"])
+        base = next((n for n in hook.body if isinstance(n, ast.ClassDef)
+                     and n.name == "_TokenizerBase"), None)
+        subclass = next((n for n in base.body if isinstance(n, ast.FunctionDef)
+                         and n.name == "__init_subclass__"), None) if base else None
+        if subclass is None or "NUMERIC_ESCAPES" in ast.unparse(subclass):
+            return False
+        return True
+
     def files_to_ids(self, files):
         return set().union(*(self.by_file.get(path, set()) for path in files))
 
     def select_ids(self, patch):
         selected = set()
         try:
-            for old, new, hunk in sections(patch):
+            edits = sections(patch)
+            for old, new, hunk in edits:
                 if old != new:
                     return self.all_ids
                 if any(line.startswith(("deleted file mode", "new file mode",
@@ -448,6 +712,11 @@ class Impact:
                         spans = changed_bodies(source, patched)
                         if self.mode.startswith("pool-"):
                             compile(patched, old, "exec", dont_inherit=True)
+                        if changed_source_header(source, patched):
+                            return self.all_ids
+                        if changed_comment_text(hunk) and ast.dump(ast.parse(source)) != ast.dump(
+                                ast.parse(patched)):
+                            return self.all_ids
                     except (ValueError, SyntaxError, RecursionError):
                         spans = None
                 if self.mode == "hybrid":
@@ -468,6 +737,24 @@ class Impact:
                         selected.update(self.by_file.get(old, ()))
                         continue
                     if not spans:
+                        if len(edits) == 1 and self.class_uses:
+                            try:
+                                edited_lambda = class_lambda_edit(source, patched)
+                            except (ValueError, SyntaxError, RecursionError):
+                                edited_lambda = None
+                            if edited_lambda:
+                                class_name, attr, _ = edited_lambda
+                                if self.safe_parser_dispatch_lambda(old, class_name, attr):
+                                    module = old.removesuffix(".py").replace("/", ".")
+                                    key = module + ":" + class_name
+                                    # Generic table readers also cover code that obtains
+                                    # the callable directly without a Parser instance.
+                                    readers, _ = self.class_readers(attr)
+                                    selected.update(self.class_uses[key], readers, self.readers,
+                                                    self.subprocess, self.unmapped,
+                                                    self.class_unprofiled, self.reflective_tests,
+                                                    self.by_file.get(old, ()))
+                                    continue
                         if self.class_uses:
                             try:
                                 edited_class = class_literal_edit(source, patched)
@@ -475,11 +762,29 @@ class Impact:
                                 edited_class = None
                             if edited_class:
                                 (class_name, attr), before, after = edited_class
+                                numeric_values = (len(edits) == 1 and attr == "NUMERIC_ESCAPES" and
+                                    self.safe_numeric_escape_values(old, class_name, before, after))
+                                module = old.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+                                key = module + ":" + class_name
+                                if numeric_values:
+                                    parent_key = module + ":" + class_name.removesuffix(".Tokenizer")
+                                    # Only direct tests of this class's data need
+                                    # source selection; metaclass-derived state is
+                                    # unchanged because the keys are identical.
+                                    explicit = {test for file, source in self.sources.items()
+                                                if file.startswith("tests/")
+                                                and (attr in source or
+                                                     class_name.split(".", 1)[0] in source)
+                                                for test in self.by_file.get(file, ())}
+                                    selected.update(self.class_uses[key], self.class_uses[parent_key],
+                                                    explicit, self.reflective_tests, self.readers,
+                                                    self.subprocess, self.unmapped,
+                                                    self.class_unprofiled,
+                                                    self.by_file.get(old, ()))
+                                    continue
                                 readers, import_read = self.class_readers(attr)
                                 expression_schema = (attr == "arg_types" and
                                     self.safe_expression_arg_types(old, class_name, before, after))
-                                module = old.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
-                                key = module + ":" + class_name
                                 if expression_schema and key in self.class_import_reads:
                                     expression_schema = False
                                 if expression_schema:
