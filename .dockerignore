@@ -6,4 +6,5 @@
 !class-uses.json.gz
 !class-import-reads.json
 !fixture-reads.json
+!fixture-shared.json
 !LICENSE.sqlglot
