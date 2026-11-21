@@ -2,6 +2,7 @@
 import ast
 from functools import lru_cache
 import gzip
+import hashlib
 import json
 import re
 
@@ -491,6 +492,17 @@ class Impact:
                     ("vars(", "__dict__", "inspect.", "getmembers(", "getattr(")):
                 self.reflective_tests.update(self.by_file.get(path, ()))
         self._class_references = {}
+        reference_path = map_path.with_name("reference-index.json.gz")
+        self.reference_index = {}
+        try:
+            with gzip.open(reference_path, "rt") as handle:
+                reference = json.load(handle)
+            if (isinstance(reference, dict)
+                    and reference.get("impact_sha256") == hashlib.sha256(map_path.read_bytes()).hexdigest()
+                    and isinstance(reference.get("references"), dict)):
+                self.reference_index = reference["references"]
+        except (OSError, ValueError, TypeError):
+            pass
 
     def valid_pool_classes(self, pool):
         """Reject an incomplete or stale child map before using class fast paths."""
@@ -527,6 +539,14 @@ class Impact:
         those require the conservative full-suite fallback.
         """
         if name in self._class_references:
+            return self._class_references[name]
+        entry = self.reference_index.get(name)
+        if (isinstance(entry, list) and len(entry) == 3
+                and isinstance(entry[0], list) and all(isinstance(value, str) for value in entry[0])
+                and isinstance(entry[1], list) and all(isinstance(value, str) for value in entry[1])
+                and isinstance(entry[2], bool)):
+            selected = set(entry[0]) | self.files_to_ids(entry[1])
+            self._class_references[name] = (selected, bool(entry[2]))
             return self._class_references[name]
         selected = set()
         import_read = False
@@ -1025,7 +1045,7 @@ class Impact:
                                 ast.parse(patched)):
                             return self.all_ids
                     except (ValueError, SyntaxError, RecursionError):
-                        spans = None
+                        return self.all_ids
                 if self.mode == "hybrid":
                     # Include static importers even when no baseline execution hit the code.
                     # Lazy imports and fixture paths are covered by observed execution.
@@ -1088,6 +1108,8 @@ class Impact:
                             except (ValueError, SyntaxError, RecursionError):
                                 edited_class = None
                             if edited_class:
+                                if len(edits) != 1:
+                                    return self.all_ids
                                 (class_name, attr), before, after = edited_class
                                 numeric_values = (len(edits) == 1 and attr == "NUMERIC_ESCAPES" and
                                     self.safe_numeric_escape_values(old, class_name, before, after))

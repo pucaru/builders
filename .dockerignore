@@ -7,6 +7,7 @@
 !class-import-reads.json
 !class-import-constructors.json
 !pool-classes.json.gz
+!reference-index.json.gz
 !fixture-reads.json
 !fixture-shared.json
 !LICENSE.sqlglot
