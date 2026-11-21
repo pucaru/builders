@@ -124,9 +124,10 @@ def replacement_statements(source, patched, hunk):
 
 Equal numbers of additions and removals do not establish a replacement:
 an inserted early return and a deleted late return can change every call.
-Limit this optimization to a one-line statement replaced immediately by
-another one-line statement of the same kind. All other shapes use the
-existing whole-function coverage fallback.
+    Limit this optimization to a one-line statement replaced immediately by
+    another one-line statement of the same kind, or an if header with
+    unchanged branches. All other shapes use the
+    existing whole-function coverage fallback.
     """
     old_tree, new_tree = ast.parse(source), ast.parse(patched)
 
@@ -157,7 +158,11 @@ existing whole-function coverage fallback.
         if not candidates:
             return None
         node = min(candidates, key=lambda item: (item.end_lineno - item.lineno, -item.lineno))
-        return node if isinstance(node, allowed) and node.lineno == node.end_lineno == lineno else None
+        if isinstance(node, allowed) and node.lineno == node.end_lineno == lineno:
+            return node
+        if isinstance(node, ast.If) and node.lineno == lineno:
+            return node
+        return None
 
     pairs = []
     removed = []
@@ -173,6 +178,22 @@ existing whole-function coverage fallback.
         after = statement(new_tree, added[0])
         if before is None or after is None or type(before) is not type(after):
             return False
+        if isinstance(before, ast.If) and (
+                ast.dump(ast.Module(body=before.body, type_ignores=[]))
+                != ast.dump(ast.Module(body=after.body, type_ignores=[]))
+                or ast.dump(ast.Module(body=before.orelse, type_ignores=[]))
+                != ast.dump(ast.Module(body=after.orelse, type_ignores=[]))):
+            return False
+        if isinstance(before, ast.If):
+            # Comprehensions, lambdas, and assignment expressions can change
+            # the enclosing function's closure/local layout at compile time
+            # even if execution never reaches this header.
+            scoped = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
+                      ast.GeneratorExp, ast.NamedExpr, ast.Yield, ast.YieldFrom,
+                      ast.Await)
+            if any(isinstance(node, scoped) for test in (before.test, after.test)
+                   for node in ast.walk(test)):
+                return False
         pairs.append((removed[0], removed[0]))
         removed.clear()
         added.clear()
@@ -502,6 +523,14 @@ class Impact:
             for key, ids in pool["classes"].items():
                 self.class_uses.setdefault(key, set()).update(ids)
             self.subprocess.update(pool["nested"])
+        numeric_path = map_path.with_name("numeric-key-uses.json.gz")
+        try:
+            with gzip.open(numeric_path, "rt") as handle:
+                numeric = json.load(handle)
+        except (OSError, ValueError):
+            numeric = None
+        self.numeric_key_uses = (numeric if self.valid_numeric_key_uses(numeric, map_path)
+                                 else None)
         self.class_unprofiled = self.all_ids - set().union(
             *(set(ids) for ids in self.class_uses.values())) if self.class_uses else set()
         self.reflective_tests = set()
@@ -549,6 +578,33 @@ class Impact:
                    and all(type(nodeid) is str for nodeid in ids)
                    and ids == sorted(set(ids))
                    and set(ids) <= set(callers) for key, ids in classes.items())
+
+    def valid_numeric_key_uses(self, numeric, map_path):
+        """Require a complete, pristine-key trace before using per-key reads."""
+        if (self.pool_classes is None or not isinstance(numeric, dict)
+                or set(numeric) != {"uses", "import_reads", "nested", "callers",
+                                    "caller_tasks", "tasks", "impact_sha256"}
+                or numeric["impact_sha256"] != hashlib.sha256(map_path.read_bytes()).hexdigest()
+                or any(numeric[name] != self.pool_classes[name] for name in
+                       ("callers", "caller_tasks", "tasks", "nested"))
+                or not isinstance(numeric["uses"], dict)
+                or not isinstance(numeric["import_reads"], dict)):
+            return False
+        for owner, keys in numeric["uses"].items():
+            if type(owner) is not str or not owner.startswith("sqlglot.") or not isinstance(keys, dict):
+                return False
+            for key, ids in keys.items():
+                if (type(key) is not str or len(key) != 1 or not isinstance(ids, list)
+                        or any(type(nodeid) is not str for nodeid in ids)
+                        or ids != sorted(set(ids)) or not set(ids) <= self.all_ids):
+                    return False
+        for owner, keys in numeric["import_reads"].items():
+            if (owner not in numeric["uses"] or not isinstance(keys, list)
+                    or any(type(key) is not str for key in keys)
+                    or keys != sorted(set(keys))
+                    or not set(keys) <= set(numeric["uses"][owner])):
+                return False
+        return True
 
     def class_readers(self, name):
         """Use pristine references to include direct class-data readers.
@@ -1235,7 +1291,7 @@ class Impact:
                 != ("tokens", "Tokenizer") or tokens[0].decorator_list
                 or tokens[0].keywords or any(
                     isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name in {"__init__", "__new__"}
+                    and node.name in {"__init__", "__new__", "_init_core", "tokenize", "tokenizer"}
                     for node in (*parents[0].body, *tokens[0].body))):
             return False
         core_reads = {}
@@ -1300,6 +1356,124 @@ class Impact:
                          and n.name == "__init_subclass__"), None) if base else None
         if subclass is None or "NUMERIC_ESCAPES" in ast.unparse(subclass):
             return False
+        return True
+
+    def numeric_key_data_flow(self):
+        """Prove the pinned core consumes tuple data only via keyed lookups.
+
+        The remaining read merely checks whether the fixed-key mapping is
+        nonempty. A value-only edit cannot change that condition.
+        """
+        if not self.numeric_pool_inputs_safe():
+            return False
+        for path, source in self.sources.items():
+            if (not path.startswith("sqlglot/")
+                    or ("numeric_escapes" not in source and "_init_core" not in source)):
+                continue
+            tree = ast.parse(source)
+            if path.startswith("sqlglot/dialects/") and any(
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "_init_core" for node in ast.walk(tree)):
+                return False
+            if path != "sqlglot/tokenizer_core.py" and any(
+                    isinstance(node, ast.Attribute) and node.attr == "numeric_escapes"
+                    and isinstance(node.ctx, ast.Load) for node in ast.walk(tree)):
+                return False
+        tree = ast.parse(self.sources["sqlglot/tokenizer_core.py"])
+        all_accesses = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+                        and node.attr == "numeric_escapes"]
+        if len(all_accesses) != 4 or sum(isinstance(node.ctx, ast.Load)
+                                         for node in all_accesses) != 3:
+            return False
+        core = next((node for node in tree.body if isinstance(node, ast.ClassDef)
+                     and node.name == "TokenizerCore"), None)
+        if core is None:
+            return False
+        accesses = {}
+        for method in core.body:
+            if not isinstance(method, ast.FunctionDef):
+                continue
+            hits = [node for node in ast.walk(method) if isinstance(node, ast.Attribute)
+                    and node.attr == "numeric_escapes"]
+            if hits:
+                accesses[method.name] = hits
+        if (set(accesses) != {"__init__", "_read_byte_escape",
+                             "_scan_numeric_escape", "_extract_string"}
+                or any(len(hits) != 1 for hits in accesses.values())
+                or not isinstance(accesses["__init__"][0].ctx, ast.Store)
+                or any(not isinstance(accesses[name][0].ctx, ast.Load)
+                       for name in ("_read_byte_escape", "_scan_numeric_escape", "_extract_string"))):
+            return False
+        init = next(node for node in core.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "__init__")
+        init_reads = [node for node in ast.walk(init) if isinstance(node, ast.Name)
+                      and node.id == "numeric_escapes" and isinstance(node.ctx, ast.Load)]
+        init_assignments = [node for node in ast.walk(init) if isinstance(node, ast.Assign)
+                            and len(node.targets) == 1
+                            and node.targets[0] is accesses["__init__"][0]
+                            and node.value in init_reads]
+        if len(init_reads) != 1 or len(init_assignments) != 1:
+            return False
+        tokens = ast.parse(self.sources["sqlglot/tokens.py"])
+        tokenizer = next((node for node in tokens.body if isinstance(node, ast.ClassDef)
+                          and node.name == "Tokenizer"), None)
+        init_core = next((node for node in tokenizer.body if isinstance(node, ast.FunctionDef)
+                          and node.name == "_init_core"), None) if tokenizer else None
+        if init_core is None:
+            return False
+        transfers = [kw for call in ast.walk(init_core) if isinstance(call, ast.Call)
+                     and isinstance(call.func, ast.Name) and call.func.id == "TokenizerCore"
+                     for kw in call.keywords if kw.arg == "numeric_escapes"
+                     and ast.unparse(kw.value) == "self.NUMERIC_ESCAPES"]
+        if len(transfers) != 1:
+            return False
+        for name in ("_read_byte_escape", "_scan_numeric_escape"):
+            method = next(node for node in core.body if isinstance(node, ast.FunctionDef)
+                          and node.name == name)
+            gets = [node for node in ast.walk(method) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                    and node.func.value is accesses[name][0]]
+            if (len(gets) != 1 or len(gets[0].args) != 1 or gets[0].keywords
+                    or ast.unparse(gets[0].args[0]) != "'0' if is_octal else peek"):
+                return False
+        extract = next(node for node in core.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "_extract_string")
+        name_reads = [n for n in ast.walk(extract) if isinstance(n, ast.Name)
+                      and n.id == "numeric_escapes" and isinstance(n.ctx, ast.Load)]
+        guards = [n for n in ast.walk(extract) if isinstance(n, ast.BoolOp)
+                  and isinstance(n.op, ast.And) and len(n.values) == 2
+                  and n.values[1] in name_reads]
+        return len(name_reads) == 1 and len(guards) == 1
+
+    def numeric_pool_inputs_safe(self):
+        """Check worker arguments before the profiling hook becomes active.
+
+        The optimizer sends a function and fixture strings/dicts. The executor
+        constructs its Expr in the traced parent before submitting it. Its
+        worker initializer merely stores schema and table arguments.
+        """
+        files = {path for path, source in self.sources.items()
+                 if path.startswith("tests/") and "ProcessPoolExecutor" in source}
+        if files != {"tests/test_optimizer.py", "tests/test_executor.py"}:
+            return False
+        expected = {
+            "tests/test_optimizer.py": "self.pool.submit(parse_and_optimize, func, sql, dialect, **func_kwargs)",
+            "tests/test_executor.py": "pool.submit(mp_execute, parse_one(sql), args)",
+        }
+        for path, invocation in expected.items():
+            tree = ast.parse(self.sources[path])
+            submits = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                       and isinstance(node.func, ast.Attribute)
+                       and node.func.attr == "submit"]
+            if len(submits) != 1 or ast.unparse(submits[0]) != invocation:
+                return False
+            if path.endswith("test_executor.py"):
+                initializer = next((node for node in tree.body
+                                    if isinstance(node, ast.FunctionDef)
+                                    and node.name == "initializer"), None)
+                if (initializer is None or [ast.unparse(node) for node in initializer.body]
+                        != ["global _schema, _tables", "_schema = schema", "_tables = tables"]):
+                    return False
         return True
 
     def files_to_ids(self, files):
@@ -1427,10 +1601,19 @@ class Impact:
                                     # field may still observe changed values.
                                     explicit = {test for file, source in self.sources.items()
                                                 if file.startswith("tests/")
-                                                and attr in source
+                                                and (attr in source or "numeric_escapes" in source)
                                                 for test in self.by_file.get(file, ())}
-                                    selected.update(self.class_uses[key],
-                                                    self.pool_classes["nested"],
+                                    key_users = set(self.class_uses[key])
+                                    if (self.numeric_key_uses is not None
+                                            and self.numeric_key_data_flow()):
+                                        edits_to_keys = {entry for entry in before
+                                                         if before[entry] != after[entry]}
+                                        imported = set(self.numeric_key_uses["import_reads"].get(key, ()))
+                                        if not edits_to_keys & imported:
+                                            reads = self.numeric_key_uses["uses"].get(key, {})
+                                            key_users = set().union(*(set(reads.get(entry, ()))
+                                                                     for entry in edits_to_keys))
+                                    selected.update(key_users, self.pool_classes["nested"],
                                                     explicit, self.reflective_tests, self.readers,
                                                     self.subprocess, self.unmapped,
                                                     self.class_unprofiled,

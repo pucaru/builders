@@ -8,6 +8,7 @@
 !class-import-constructors.json
 !parser-lambda-import-calls.json
 !pool-classes.json.gz
+!numeric-key-uses.json.gz
 !reference-index.json.gz
 !fixture-reads.json
 !fixture-shared.json
