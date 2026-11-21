@@ -347,6 +347,86 @@ def class_lambda_edit(source, patched):
     return key
 
 
+def class_factory_literal_edit(source, patched):
+    """Find one changed literal argument in a class dictionary factory call.
+
+    This recognizes only a pre-existing string key and a direct call to a
+    named factory. Every other AST node, including the call target and keyword
+    names, must be identical after masking the one changed argument.
+    """
+    before, after = ast.parse(source, type_comments=True), ast.parse(patched, type_comments=True)
+
+    def calls(tree):
+        found = {}
+
+        def classes(body, prefix):
+            for node in body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                qual = prefix + node.name
+                for stmt in node.body:
+                    if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                            and isinstance(stmt.targets[0], ast.Name)):
+                        field, value = stmt.targets[0].id, stmt.value
+                    elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                        field, value = stmt.target.id, stmt.value
+                    else:
+                        continue
+                    if not isinstance(value, ast.Dict):
+                        continue
+                    for key, item in zip(value.keys, value.values):
+                        if (isinstance(key, ast.Constant) and type(key.value) is str
+                                and isinstance(item, ast.Call) and isinstance(item.func, ast.Name)):
+                            found.setdefault((qual, field, key.value), []).append(item)
+                classes(node.body, qual + ".")
+
+        classes(tree.body, "")
+        return found
+
+    old, new = calls(before), calls(after)
+    options = []
+
+    def literal(node):
+        try:
+            value = ast.literal_eval(node)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return False
+        return type(value) in (type(None), bool, int, float, str, bytes)
+
+    for key in old.keys() & new.keys():
+        if len(old[key]) != 1 or len(new[key]) != 1:
+            continue
+        a, b = old[key][0], new[key][0]
+        if (a.func.id != b.func.id or len(a.args) != len(b.args)
+                or len(a.keywords) != len(b.keywords)
+                or any(not literal(arg) for arg in a.args + b.args)
+                or any(kw.arg is None or not literal(kw.value)
+                       for kw in a.keywords + b.keywords)
+                or [kw.arg for kw in a.keywords] != [kw.arg for kw in b.keywords]):
+            continue
+        positions = [(x, y) for x, y in zip(a.args, b.args)]
+        positions += [(x.value, y.value) for x, y in zip(a.keywords, b.keywords)]
+        changes = [(x, y) for x, y in positions
+                   if ast.dump(x, include_attributes=False) != ast.dump(y, include_attributes=False)]
+        if len(changes) != 1:
+            continue
+        options.append((key, a, b, changes[0]))
+    if len(options) != 1:
+        return None
+    key, a, b, (old_arg, new_arg) = options[0]
+    for call, target in ((a, old_arg), (b, new_arg)):
+        replacement = ast.Constant(value="__blast_factory_literal__")
+        for i, arg in enumerate(call.args):
+            if arg is target:
+                call.args[i] = replacement
+        for keyword in call.keywords:
+            if keyword.value is target:
+                keyword.value = replacement
+    if ast.dump(before, include_attributes=False) != ast.dump(after, include_attributes=False):
+        return None
+    return key, a.func.id
+
+
 class Impact:
     def __init__(self, tests, map_path, mode):
         with gzip.open(map_path, "rt") as handle:
@@ -374,13 +454,25 @@ class Impact:
         )
         class_path = map_path.with_name("class-uses.json.gz")
         with gzip.open(class_path, "rt") if class_path.exists() else open("/dev/null") as handle:
-            self.class_uses = json.load(handle) if class_path.exists() else {}
+            self.class_uses = ({key: set(ids) for key, ids in json.load(handle).items()}
+                               if class_path.exists() else {})
         import_path = map_path.with_name("class-import-reads.json")
         self.class_import_reads = (set(json.loads(import_path.read_text()))
                                    if import_path.exists() else None)
         constructor_path = map_path.with_name("class-import-constructors.json")
         self.class_import_constructors = (set(json.loads(constructor_path.read_text()))
                                           if constructor_path.exists() else None)
+        pool_path = map_path.with_name("pool-classes.json.gz")
+        try:
+            with gzip.open(pool_path, "rt") as handle:
+                pool = json.load(handle)
+        except (OSError, ValueError):
+            pool = None
+        self.pool_classes = pool if self.valid_pool_classes(pool) else None
+        if self.pool_classes is not None:
+            for key, ids in pool["classes"].items():
+                self.class_uses.setdefault(key, set()).update(ids)
+            self.subprocess.update(pool["nested"])
         self.class_unprofiled = self.all_ids - set().union(
             *(set(ids) for ids in self.class_uses.values())) if self.class_uses else set()
         self.reflective_tests = set()
@@ -389,6 +481,34 @@ class Impact:
                     ("vars(", "__dict__", "inspect.", "getmembers(", "getattr(")):
                 self.reflective_tests.update(self.by_file.get(path, ()))
         self._class_references = {}
+
+    def valid_pool_classes(self, pool):
+        """Reject an incomplete or stale child map before using class fast paths."""
+        if (not isinstance(pool, dict) or set(pool) != {
+                "classes", "callers", "caller_tasks", "nested", "tasks"}):
+            return False
+        classes, callers, counts = pool["classes"], pool["callers"], pool["caller_tasks"]
+        nested, tasks = pool["nested"], pool["tasks"]
+        if (not isinstance(classes, dict) or not isinstance(callers, list)
+                or not isinstance(counts, dict) or not isinstance(nested, list)
+                or type(tasks) is not int or tasks <= 0
+                or any(type(x) is not str for x in callers)
+                or callers != sorted(set(callers)) or not set(callers) <= self.all_ids
+                or set(counts) != set(callers)
+                or any(type(v) is not int or v <= 0 for v in counts.values())
+                or sum(counts.values()) != tasks
+                or any(type(x) is not str for x in nested)
+                or nested != sorted(set(nested)) or not set(nested) <= set(callers)):
+            return False
+        pool_files = {path for path, source in self.sources.items()
+                      if path.startswith("tests/") and "ProcessPoolExecutor" in source}
+        if {nodeid.split("::", 1)[0] for nodeid in callers} != pool_files:
+            return False
+        return all(type(key) is str and key.startswith("sqlglot.")
+                   and isinstance(ids, list)
+                   and all(type(nodeid) is str for nodeid in ids)
+                   and ids == sorted(set(ids))
+                   and set(ids) <= set(callers) for key, ids in classes.items())
 
     def class_readers(self, name):
         """Use pristine references to include direct class-data readers.
@@ -562,6 +682,182 @@ class Impact:
             return False
         return True
 
+    def safe_parser_closure_factory(self, path, class_name, field, factory):
+        """Prove that a class table factory only captures literal arguments.
+
+        A factory call made while the class body runs must have no observable
+        work until its returned closure is called on a Parser. The pinned
+        class cannot have a construction hook inspecting its table values.
+        """
+        if (field != "SHOW_PARSERS" or not path.startswith("sqlglot/parsers/")
+                or self.class_import_constructors is None):
+            return False
+        module = path.removesuffix(".py").replace("/", ".")
+        key = module + ":" + class_name
+        if key in self.class_import_constructors or key not in self.class_uses:
+            return False
+        if any(class_name + "." + field in text for text in self.sources.values()):
+            # A derived class may import-copy the table and later call the
+            # changed closure without constructing the original class.
+            return False
+
+        def find_class(source_path, name):
+            tree = ast.parse(self.sources[source_path])
+            classes = [node for node in tree.body if isinstance(node, ast.ClassDef)
+                       and node.name == name]
+            return (tree, classes[0]) if len(classes) == 1 else (tree, None)
+
+        source, owner = find_class(path, class_name)
+        if owner is None:
+            return False
+        # Follow simple import-from class inheritance through the pristine
+        # parser package; any decorators, metaclasses or hooks fail closed.
+        current_path, current_tree, current = path, source, owner
+        for _ in range(8):
+            if (current.decorator_list or current.keywords or len(current.bases) != 1
+                    or any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                           and n.name in {"__init_subclass__", "__init__", "__new__"}
+                           for n in current.body)):
+                return False
+            base = current.bases[0]
+            if (isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name)
+                    and (base.value.id, base.attr) == ("parser", "Parser")):
+                break
+            if not isinstance(base, ast.Name):
+                return False
+            imports = [n for n in current_tree.body if isinstance(n, ast.ImportFrom)
+                       and n.module and n.module.startswith("sqlglot.parsers.")
+                       for alias in n.names if (alias.asname or alias.name) == base.id]
+            if len(imports) != 1:
+                return False
+            current_path = imports[0].module.replace(".", "/") + ".py"
+            if current_path not in self.sources:
+                return False
+            current_tree, current = find_class(current_path, base.id)
+            if current is None:
+                return False
+        else:
+            return False
+        parser = ast.parse(self.sources["sqlglot/parser.py"])
+        roots = [n for n in parser.body if isinstance(n, ast.ClassDef) and n.name == "Parser"]
+        if (len(roots) != 1 or roots[0].bases or roots[0].keywords
+                or roots[0].decorator_list or any(
+                    isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name == "__init_subclass__" for n in roots[0].body)):
+            return False
+
+        fields = [n for n in owner.body if isinstance(n, ast.Assign)
+                  and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                  and n.targets[0].id == field]
+        if len(fields) != 1:
+            return False
+        trie_imports = [n for n in source.body if isinstance(n, ast.ImportFrom)
+                        and n.module == "sqlglot.trie"
+                        for alias in n.names if alias.name == "new_trie" and alias.asname is None]
+        if (len(trie_imports) != 1 or any(
+                isinstance(n, ast.Name) and n.id == "new_trie"
+                and isinstance(n.ctx, (ast.Store, ast.Del)) for n in ast.walk(source))):
+            return False
+        for stmt in owner.body:
+            if stmt is fields[0]:
+                continue
+            if not any((isinstance(n, ast.Name) and n.id == field
+                        and isinstance(n.ctx, ast.Load))
+                       or (isinstance(n, ast.Attribute) and n.attr == field)
+                       or (isinstance(n, ast.Constant) and n.value == field)
+                       for n in ast.walk(stmt)):
+                continue
+            # A derived trie can depend on the table's keys, but not its
+            # changed closure or values.
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and stmt.targets[0].id == "SHOW_TRIE"
+                    and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Name)
+                    and stmt.value.func.id == "new_trie"
+                    and len(stmt.value.args) == 1
+                    and not stmt.value.keywords
+                    and isinstance(stmt.value.args[0], ast.GeneratorExp)
+                    and len(stmt.value.args[0].generators) == 1
+                    and not stmt.value.args[0].generators[0].ifs
+                    and not stmt.value.args[0].generators[0].is_async
+                    and isinstance(stmt.value.args[0].generators[0].iter, ast.Name)
+                    and stmt.value.args[0].generators[0].iter.id == field
+                    and isinstance(stmt.value.args[0].generators[0].target, ast.Name)
+                    and isinstance(stmt.value.args[0].elt, ast.Call)
+                    and isinstance(stmt.value.args[0].elt.func, ast.Attribute)
+                    and isinstance(stmt.value.args[0].elt.func.value, ast.Name)
+                    and stmt.value.args[0].elt.func.value.id
+                    == stmt.value.args[0].generators[0].target.id
+                    and stmt.value.args[0].elt.func.attr == "split"
+                    and len(stmt.value.args[0].elt.args) == 1
+                    and isinstance(stmt.value.args[0].elt.args[0], ast.Constant)
+                    and stmt.value.args[0].elt.args[0].value == " "
+                    and not stmt.value.args[0].elt.keywords
+                    and [n for n in ast.walk(stmt) if isinstance(n, ast.Name)
+                         and n.id == field and isinstance(n.ctx, ast.Load)]
+                    == [stmt.value.args[0].generators[0].iter]):
+                return False
+
+        # A different alias such as Dialect.Parser.SHOW_PARSERS could copy or
+        # call this table during import without constructing its owning class.
+        # The only SQLGlot attribute reads allowed are the base class table
+        # merged into this table and Parser's runtime instance dispatch.
+        owner_base = owner.bases[0].id if isinstance(owner.bases[0], ast.Name) else None
+        for source_path, text in self.sources.items():
+            if not source_path.startswith("sqlglot/") or field not in text:
+                continue
+            for node in ast.walk(source if source_path == path else ast.parse(text)):
+                if not (isinstance(node, ast.Attribute) and node.attr == field
+                        and isinstance(node.ctx, ast.Load)):
+                    continue
+                base_copy = (source_path == path and isinstance(node.value, ast.Name)
+                             and node.value.id == owner_base
+                             and any(node in ast.walk(field_node) for field_node in fields))
+                runtime_read = (source_path == "sqlglot/parser.py"
+                                and isinstance(node.value, ast.Name)
+                                and node.value.id == "self")
+                if not (base_copy or runtime_read):
+                    return False
+
+        imports = [n for n in source.body if isinstance(n, ast.ImportFrom)
+                   and n.module and n.module.startswith("sqlglot.")
+                   for alias in n.names if (alias.asname or alias.name) == factory]
+        if len(imports) != 1:
+            return False
+        factory_path = imports[0].module.replace(".", "/") + ".py"
+        if factory_path not in self.sources:
+            return False
+        factory_source = ast.parse(self.sources[factory_path])
+        functions = [n for n in factory_source.body if isinstance(n, ast.FunctionDef)
+                     and n.name == factory]
+        if (len(functions) != 1 or functions[0].decorator_list
+                or getattr(functions[0], "type_params", ())):
+            return False
+        body = functions[0].body
+        if (len(body) != 2 or not isinstance(body[0], ast.FunctionDef)
+                or not isinstance(body[1], ast.Return)
+                or not isinstance(body[1].value, ast.Name)
+                or body[1].value.id != body[0].name
+                or body[0].decorator_list or body[0].args.defaults
+                or getattr(body[0], "type_params", ())
+                or any(arg is not None for arg in body[0].args.kw_defaults)):
+            return False
+        has_future_annotations = any(
+            isinstance(n, ast.ImportFrom) and n.module == "__future__"
+            and any(alias.name == "annotations" for alias in n.names)
+            for n in factory_source.body)
+        annotations = [arg.annotation for arg in (
+            *body[0].args.posonlyargs, *body[0].args.args, *body[0].args.kwonlyargs)
+            if arg.annotation is not None]
+        annotations += [arg.annotation for arg in (body[0].args.vararg, body[0].args.kwarg)
+                        if arg is not None and arg.annotation is not None]
+        if body[0].returns is not None:
+            annotations.append(body[0].returns)
+        if annotations and not has_future_annotations:
+            return False
+        return True
+
     def safe_numeric_escape_values(self, path, class_name, before, after):
         """Narrow fixed-key numeric escape edits after verifying import behavior.
 
@@ -569,7 +865,8 @@ class Impact:
         derived escape tables. Values flow to runtime Tokenizer instances. This
         condition fails closed if that metaclass or any SQLGlot read site changes.
         """
-        if (self.class_import_constructors is None or not path.startswith("sqlglot/dialects/")
+        if (self.class_import_constructors is None or self.pool_classes is None
+                or not path.startswith("sqlglot/dialects/")
                 or not class_name.endswith(".Tokenizer") or not isinstance(before, dict)
                 or not isinstance(after, dict) or before.keys() != after.keys()
                 or not all(type(k) is str and type(v) is tuple and len(v) == 4
@@ -737,6 +1034,26 @@ class Impact:
                         selected.update(self.by_file.get(old, ()))
                         continue
                     if not spans:
+                        # Class consumers in spawned workers are absent from
+                        # the parent trace. A missing or incomplete child map
+                        # cannot justify narrowing structural edits.
+                        if self.pool_classes is None:
+                            return self.all_ids
+                        if len(edits) == 1 and self.class_uses:
+                            try:
+                                edited_factory = class_factory_literal_edit(source, patched)
+                            except (ValueError, SyntaxError, RecursionError):
+                                edited_factory = None
+                            if edited_factory:
+                                (class_name, attr, _), factory = edited_factory
+                                if self.safe_parser_closure_factory(old, class_name, attr, factory):
+                                    key = old.removesuffix(".py").replace("/", ".") + ":" + class_name
+                                    readers, _ = self.class_readers(attr)
+                                    selected.update(self.class_uses[key], readers, self.readers,
+                                                    self.subprocess, self.unmapped,
+                                                    self.class_unprofiled, self.reflective_tests,
+                                                    self.by_file.get(old, ()))
+                                    continue
                         if len(edits) == 1 and self.class_uses:
                             try:
                                 edited_lambda = class_lambda_edit(source, patched)
@@ -768,15 +1085,15 @@ class Impact:
                                 key = module + ":" + class_name
                                 if numeric_values:
                                     parent_key = module + ":" + class_name.removesuffix(".Tokenizer")
-                                    # Only direct tests of this class's data need
-                                    # source selection; metaclass-derived state is
-                                    # unchanged because the keys are identical.
+                                    # The pinned metaclass and generator only read
+                                    # keys or truthiness. A direct test of the
+                                    # field may still observe changed values.
                                     explicit = {test for file, source in self.sources.items()
                                                 if file.startswith("tests/")
-                                                and (attr in source or
-                                                     class_name.split(".", 1)[0] in source)
+                                                and attr in source
                                                 for test in self.by_file.get(file, ())}
-                                    selected.update(self.class_uses[key], self.class_uses[parent_key],
+                                    selected.update(self.class_uses[key],
+                                                    self.pool_classes["nested"],
                                                     explicit, self.reflective_tests, self.readers,
                                                     self.subprocess, self.unmapped,
                                                     self.class_unprofiled,
