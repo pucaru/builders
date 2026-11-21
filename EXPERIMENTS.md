@@ -19,7 +19,7 @@ The prior release costs 42.306 seconds on the independent dialect and class pair
 
 ## Statement and shared-setup experiment
 
-An independent review of public entries identified two mechanisms worth testing: statement-level impact within otherwise unchanged function bodies, and attribution of fixture reads from class setup to all tests in that class. This branch implements both from the pinned pristine checkout without using another team's code. The shared fixture map comes from a clean run with 1,620 tests passing, one skipped, and 25,440 subtests passing. It identifies 34 paths opened during `setUpClass`, including the TPC-H and TPC-DS inputs in `TestExecutor`. Normal per-method fixture reads stay with the reading test.
+We tested statement-level impact within otherwise unchanged function bodies and attribution of fixture reads from class setup to all tests in that class. Both maps come from the pinned pristine checkout. The shared fixture map comes from a clean run with 1,620 tests passing, one skipped, and 25,440 subtests passing. It identifies 34 paths opened during `setUpClass`, including the TPC-H and TPC-DS inputs in `TestExecutor`. Normal per-method fixture reads stay with the reading test.
 
 | Corpus | Main simulated s | Candidate simulated s | Candidate misses |
 | --- | ---: | ---: | ---: |
