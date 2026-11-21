@@ -473,6 +473,24 @@ class Impact:
         constructor_path = map_path.with_name("class-import-constructors.json")
         self.class_import_constructors = (set(json.loads(constructor_path.read_text()))
                                           if constructor_path.exists() else None)
+        lambda_path = map_path.with_name("parser-lambda-import-calls.json")
+        try:
+            payload = json.loads(lambda_path.read_text())
+            if (not isinstance(payload, dict)
+                    or payload.get("impact_sha256")
+                    != hashlib.sha256(map_path.read_bytes()).hexdigest()):
+                raise ValueError("lambda import map does not match impact map")
+            lambda_calls = payload.get("calls")
+            shared_calls = payload.get("shared_calls")
+            if not isinstance(lambda_calls, list) or not isinstance(shared_calls, list) or not all(
+                    isinstance(row, list) and len(row) == 3
+                    and type(row[0]) is str and type(row[1]) is int
+                    and type(row[2]) is str for row in lambda_calls + shared_calls):
+                raise ValueError("invalid lambda import call map")
+            self.parser_lambda_import_calls = {(path, line) for path, line, _
+                                               in lambda_calls + shared_calls}
+        except (OSError, ValueError, TypeError):
+            self.parser_lambda_import_calls = None
         pool_path = map_path.with_name("pool-classes.json.gz")
         try:
             with gzip.open(pool_path, "rt") as handle:
@@ -711,6 +729,200 @@ class Impact:
         if any(direct in text for text in self.sources.values()):
             return False
         return True
+
+    def parser_lambda_readers(self, path, class_name, field, entry):
+        """Keep dynamic table readers and observed calls of the edited lambda.
+
+        A class-body copy from a statically different Parser base cannot copy
+        this subclass's table. Parser's own `self.FUNCTIONS` read is covered by
+        the exact receiver constructor map; all other runtime table readers
+        and the lambda body's observed executions stay selected.
+        """
+        if self.parser_lambda_import_calls is None:
+            return None
+        target_module = path.removesuffix(".py").replace("/", ".")
+        tree = ast.parse(self.sources[path])
+        owners = [n for n in tree.body if isinstance(n, ast.ClassDef)
+                  and n.name == class_name]
+        if len(owners) != 1:
+            return None
+        fields = [n for n in owners[0].body if isinstance(n, ast.Assign)
+                  and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                  and n.targets[0].id == field and isinstance(n.value, ast.Dict)]
+        if len(fields) != 1:
+            return None
+        lambdas = [v for k, v in zip(fields[0].value.keys, fields[0].value.values)
+                   if isinstance(k, ast.Constant) and k.value == entry
+                   and isinstance(v, ast.Lambda)]
+        if len(lambdas) != 1:
+            return None
+        target = lambdas[0]
+        if (path, target.lineno) in self.parser_lambda_import_calls:
+            return None
+        selected = set()
+        passive_factories = {}
+
+        def passive_factory(source_path, source_tree, name):
+            cache_key = (source_path, name)
+            if cache_key in passive_factories:
+                return passive_factories[cache_key]
+            functions = [n for n in source_tree.body if isinstance(n, ast.FunctionDef)
+                         and n.name == name]
+            definition = source_tree
+            if not functions:
+                imports = [n for n in source_tree.body if isinstance(n, ast.ImportFrom)
+                           and n.module and n.module.startswith("sqlglot.")
+                           for alias in n.names if (alias.asname or alias.name) == name]
+                if len(imports) == 1:
+                    factory_path = imports[0].module.replace(".", "/") + ".py"
+                    if factory_path in self.sources:
+                        definition = ast.parse(self.sources[factory_path])
+                        functions = [n for n in definition.body
+                                     if isinstance(n, ast.FunctionDef) and n.name == name]
+            result = False
+            if len(functions) == 1 and not functions[0].decorator_list:
+                body = functions[0].body
+                result = (len(body) == 2 and isinstance(body[0], ast.FunctionDef)
+                          and isinstance(body[1], ast.Return)
+                          and isinstance(body[1].value, ast.Name)
+                          and body[1].value.id == body[0].name
+                          and not body[0].decorator_list
+                          and not body[0].args.defaults
+                          and not any(v is not None for v in body[0].args.kw_defaults)
+                          and any(isinstance(n, ast.ImportFrom)
+                                  and n.module == "__future__"
+                                  and any(alias.name == "annotations" for alias in n.names)
+                                  for n in definition.body))
+            passive_factories[cache_key] = result
+            return result
+
+        target_lines = self.lines.get(path, {})
+        if not target_lines:
+            return None
+        for line in range(target.body.lineno, target.body.end_lineno + 1):
+            index = target_lines.get(str(line))
+            if index is None:
+                continue
+            group = set(self.contexts[index])
+            # A same-line class definition is traced during import, too. The
+            # class/alias audit below rules out import-time invocation via an
+            # unconstructed receiver. A later body line with an import hit is
+            # an actual import-time call and requires the broad fallback.
+            if "" in group and line != target.lineno:
+                return None
+            group.discard("")
+            selected.update(group)
+
+        for source_path, text in self.sources.items():
+            if field not in text:
+                continue
+            root = tree if source_path == path else ast.parse(text)
+            parents = {child: node for node in ast.walk(root)
+                       for child in ast.iter_child_nodes(node)}
+            aliases = {class_name}
+            for imp in root.body:
+                if isinstance(imp, ast.ImportFrom) and imp.module == target_module:
+                    aliases.update((alias.asname or alias.name) for alias in imp.names
+                                   if alias.name == class_name)
+            for candidate in ast.walk(root):
+                if not isinstance(candidate, ast.ClassDef):
+                    continue
+                if any((isinstance(base, ast.Name) and base.id in aliases)
+                       or (isinstance(base, ast.Attribute) and base.attr == class_name)
+                       for base in candidate.bases):
+                    return None
+
+            def enclosing(node):
+                child = node
+                while child in parents:
+                    child = parents[child]
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                          ast.Lambda, ast.ClassDef)):
+                        return child
+                return None
+
+            def is_read(node):
+                return ((isinstance(node, ast.Name) and node.id == field
+                         and isinstance(node.ctx, ast.Load))
+                        or (isinstance(node, ast.Attribute) and node.attr == field
+                            and isinstance(node.ctx, ast.Load))
+                        or (isinstance(node, ast.Constant) and node.value == field))
+
+            for node in ast.walk(root):
+                if not is_read(node):
+                    continue
+                if source_path.startswith("tests/"):
+                    scope = node
+                    runtime_scope = False
+                    while scope in parents:
+                        child = scope
+                        scope = parents[scope]
+                        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                              ast.Lambda)):
+                            runtime_scope = (isinstance(scope, ast.Lambda)
+                                             and child is scope.body) or (
+                                                 hasattr(scope, "body")
+                                                 and isinstance(scope.body, list)
+                                                 and child in scope.body)
+                            break
+                    if not runtime_scope:
+                        # A collection-time test-module read can seed state
+                        # observed by tests in another file.
+                        return None
+                    selected.update(self.by_file.get(source_path, ()))
+                    continue
+                if isinstance(node, ast.Constant) and isinstance(parents.get(node), ast.Dict):
+                    if node in parents[node].keys:
+                        continue
+                ancestor = enclosing(node)
+                if isinstance(ancestor, ast.ClassDef):
+                    if ancestor.name == class_name and source_path == path:
+                        # An unexpected import-time read of the edited table
+                        # could construct persistent state for other tests.
+                        if node not in ast.walk(fields[0]):
+                            return None
+                        continue
+                    if isinstance(node, ast.Constant) and ancestor.name != class_name:
+                        call = parents.get(node)
+                        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                                and passive_factory(source_path, root, call.func.id)):
+                            # A passive factory merely captures this string
+                            # for a different class's runtime dispatch.
+                            continue
+                        # getattr(alias, "FUNCTIONS") and other active calls
+                        # can copy our changed table during import.
+                        return None
+                    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                        receiver = node.value.id
+                        bases = {base.id for base in ancestor.bases if isinstance(base, ast.Name)}
+                        if receiver in bases and receiver not in aliases:
+                            continue
+                    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute):
+                        receiver = node.value
+                        if (receiver.attr == "Parser" and isinstance(receiver.value, ast.Name)
+                                and receiver.value.id == "parser"):
+                            continue
+                    if isinstance(node, ast.Name) and ancestor.name != class_name:
+                        continue
+                    return None
+                if (source_path == "sqlglot/parser.py" and isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name) and node.value.id == "self"
+                        and isinstance(ancestor, ast.FunctionDef)
+                        and ancestor.args.args and ancestor.args.args[0].arg == "self"
+                        and isinstance(parents.get(ancestor), ast.ClassDef)
+                        and parents[ancestor].name == "Parser"):
+                    continue
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                    if node.value.id in aliases:
+                        return None
+                index = self.lines.get(source_path, {}).get(str(node.lineno))
+                if index is None:
+                    return None
+                group = set(self.contexts[index])
+                if "" in group:
+                    return None
+                selected.update(group)
+        return selected
 
     def safe_parser_closure_factory(self, path, class_name, field, factory):
         """Prove that a class table factory only captures literal arguments.
@@ -1090,18 +1302,17 @@ class Impact:
                             except (ValueError, SyntaxError, RecursionError):
                                 edited_lambda = None
                             if edited_lambda:
-                                class_name, attr, _ = edited_lambda
+                                class_name, attr, entry = edited_lambda
                                 if self.safe_parser_dispatch_lambda(old, class_name, attr):
                                     module = old.removesuffix(".py").replace("/", ".")
                                     key = module + ":" + class_name
-                                    # Generic table readers also cover code that obtains
-                                    # the callable directly without a Parser instance.
-                                    readers, _ = self.class_readers(attr)
-                                    selected.update(self.class_uses[key], readers, self.readers,
-                                                    self.subprocess, self.unmapped,
-                                                    self.class_unprofiled, self.reflective_tests,
-                                                    self.by_file.get(old, ()))
-                                    continue
+                                    readers = self.parser_lambda_readers(old, class_name, attr, entry)
+                                    if readers is not None:
+                                        selected.update(self.class_uses[key], readers, self.readers,
+                                                        self.subprocess, self.unmapped,
+                                                        self.class_unprofiled, self.reflective_tests,
+                                                        self.by_file.get(old, ()))
+                                        continue
                         if self.class_uses:
                             try:
                                 edited_class = class_literal_edit(source, patched)

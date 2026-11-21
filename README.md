@@ -32,6 +32,7 @@ For a host run, use `python3 selector.py --data "$KIT/sample"`. The official sco
 - The clean class profile separately records classes constructed outside test contexts. A second profile records dialect, tokenizer, parser, generator, and expression constructors inside spawned process-pool tasks and merges those users into every class selection. A sole lambda-body edit within a direct `Parser.FUNCTIONS` subclass dispatch table selects that parser's class users and generic table readers after proving no subclass hook or direct table alias is present. A same-key, value-only change to a nested dialect Tokenizer's `NUMERIC_ESCAPES` selects its tokenizer constructor users in the parent suite and spawned process pools. The pinned metaclass and generator inspect keys or truthiness only, so dialect construction alone does not consume changed tuple values. Tests with a direct source mention of `NUMERIC_ESCAPES`, reflective tests, opaque subprocess callers, and unprofiled tests are also included. Changed keys, other class shapes, unexpected read sites, absent maps, and multi-file changes retain broad selection. A missing or inconsistent child map makes structural edits select all tests.
 - Class field reader lookup uses a compressed, inverted index of the same pinned source references and clean-suite coverage contexts. A missing, stale, or malformed index falls back to the original source scan.
 - A single changed literal argument in an existing `SHOW_PARSERS` factory entry can use class consumers when the pinned factory only returns a closure and the class's derived trie reads dictionary keys. The selector verifies the factory, parser inheritance and constructor hooks, import-time aliases, and every other module AST node. Unsupported factories and multi-file patches use the existing fallback.
+- For a sole lambda-body change in a direct Parser subclass's `FUNCTIONS` table, a receiver-aware read scan keeps observed executions of that lambda and dynamic `parser_class.FUNCTIONS` readers. It excludes copies of unrelated base class tables and the base Parser's `self.FUNCTIONS` read, whose target receiver is covered by parent and process-pool constructor maps. A separate clean-suite trace records parser lambdas called during import, fixture setup, or teardown; those edits select all tests. Missing or stale trace data also selects all tests. The trace is bound to the compressed impact map by SHA-256.
 
 ## Rebuild the maps
 
@@ -52,6 +53,11 @@ SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_classes.py \
   --constructor-import-output class-import-constructors.json
 SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_pool_classes.py \
   "$SQLGLOT" "$KIT/sample/tests.json" pool-classes.json.gz
+python tools/profile_lambda_imports.py "$SQLGLOT" /tmp/parser-lambda-import-sweep.json \
+  --impact-map impact.json.gz --sweep-imports
+SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_lambda_imports.py \
+  "$SQLGLOT" parser-lambda-import-calls.json --impact-map impact.json.gz \
+  --merge /tmp/parser-lambda-import-sweep.json
 ```
 
 The compressed map includes pristine source text for diff verification. The pool profile rejects a clean run unless every submitted task has a matching child record. The selector checks map consistency and uses the full suite for structural edits if it is missing. SQLGlot's [MIT license](LICENSE.sqlglot) ships with the map. Raw profiles and regression labels are outside the Docker build context. The image build uses the organizer's digest-pinned Python 3.13 base and performs no package installation.

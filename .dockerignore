@@ -6,6 +6,7 @@
 !class-uses.json.gz
 !class-import-reads.json
 !class-import-constructors.json
+!parser-lambda-import-calls.json
 !pool-classes.json.gz
 !reference-index.json.gz
 !fixture-reads.json
