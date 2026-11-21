@@ -10,6 +10,7 @@ import types
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 PARSER_LAMBDA_READER_INDEX_VERSION = 1
+NUMERIC_SAFETY_INDEX_VERSION = 1
 
 
 def sections(patch):
@@ -662,6 +663,16 @@ class Impact:
             numeric = None
         self.numeric_key_uses = (numeric if self.valid_numeric_key_uses(numeric, map_path)
                                  else None)
+        numeric_safety_path = map_path.with_name("numeric-safety-index.json.gz")
+        try:
+            with gzip.open(numeric_safety_path, "rb") as handle:
+                numeric_safety = json.load(handle)
+        except (OSError, EOFError, ValueError):
+            numeric_safety = None
+        self.numeric_safety_index = (
+            {tuple(row[:2]): row[2] for row in numeric_safety["entries"]}
+            if self.valid_numeric_safety_index(numeric_safety, map_path) else None
+        )
         scalar_path = map_path.with_name("scalar-reads.json.gz")
         try:
             with gzip.open(scalar_path, "rt") as handle:
@@ -787,6 +798,38 @@ class Impact:
                     or not set(fields) <= set(scalar["uses"][owner])):
                 return False
         return True
+
+    def valid_numeric_safety_index(self, index, map_path):
+        """Bind precomputed static table proofs to every pristine input."""
+        hashes = {
+            "class_uses_sha256": map_path.with_name("class-uses.json.gz"),
+            "constructors_sha256": map_path.with_name("class-import-constructors.json"),
+            "pool_sha256": map_path.with_name("pool-classes.json.gz"),
+        }
+        if (not isinstance(index, dict)
+                or set(index) != {"version", "impact_sha256", *hashes,
+                                  "ids_sha256", "entries_sha256", "entries"}
+                or index["version"] != NUMERIC_SAFETY_INDEX_VERSION
+                or index["impact_sha256"] != hashlib.sha256(map_path.read_bytes()).hexdigest()
+                or any(index[name] != hashlib.sha256(path.read_bytes()).hexdigest()
+                       for name, path in hashes.items())
+                or index["ids_sha256"] != hashlib.sha256(
+                    json.dumps(sorted(self.all_ids), separators=(",", ":")).encode()
+                ).hexdigest()
+                or not isinstance(index["entries"], list)
+                or index["entries_sha256"] != hashlib.sha256(
+                    json.dumps(index["entries"], separators=(",", ":")).encode()
+                ).hexdigest()):
+            return False
+        keys = []
+        for row in index["entries"]:
+            if (not isinstance(row, list) or len(row) != 3
+                    or type(row[0]) is not str or not row[0].startswith("sqlglot/dialects/")
+                    or row[0] not in self.sources or type(row[1]) is not str
+                    or not row[1].endswith(".Tokenizer") or type(row[2]) is not bool):
+                return False
+            keys.append(tuple(row[:2]))
+        return keys == sorted(set(keys))
 
     def valid_lambda_call_uses(self, profile, map_path):
         """Reject incomplete or stale clean-suite lambda call observations."""
@@ -1641,6 +1684,9 @@ class Impact:
                 or not all(type(v) is tuple and len(v) == 4
                            and all(type(x) is int for x in v) for v in after.values())):
             return False
+        index_key = (path, class_name)
+        if self.numeric_safety_index is not None and index_key in self.numeric_safety_index:
+            return self.numeric_safety_index[index_key]
         module = path.removesuffix(".py").replace("/", ".")
         token_key = module + ":" + class_name
         parent_key = module + ":" + class_name.removesuffix(".Tokenizer")

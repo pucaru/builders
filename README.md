@@ -69,6 +69,8 @@ SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_pool_classes.py \
 SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_numeric_keys.py \
   "$SQLGLOT" "$KIT/sample/tests.json" numeric-key-uses.json.gz \
   --impact-map impact.json.gz
+python tools/build_numeric_safety_index.py "$KIT/sample/tests.json" \
+  numeric-safety-index.json.gz --map impact.json.gz
 SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 python tools/profile_scalar_reads.py \
   "$SQLGLOT" "$KIT/sample/tests.json" scalar-reads.json.gz \
   --impact-map impact.json.gz

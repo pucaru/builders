@@ -11,6 +11,7 @@
 !parser-lambda-reader-index.json.gz
 !pool-classes.json.gz
 !numeric-key-uses.json.gz
+!numeric-safety-index.json.gz
 !scalar-reads.json.gz
 !reference-index.json.gz
 !comment-source-reads.json
