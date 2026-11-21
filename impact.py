@@ -472,7 +472,7 @@ def class_factory_literal_edit(source, patched):
 
 class Impact:
     def __init__(self, tests, map_path, mode):
-        with gzip.open(map_path, "rt") as handle:
+        with gzip.open(map_path, "rb") as handle:
             self.maps = json.load(handle)
         fixture_path = map_path.with_name("fixture-reads.json")
         self.fixture_reads = json.loads(fixture_path.read_text()) if fixture_path.exists() else {}
@@ -546,7 +546,7 @@ class Impact:
         )
         class_path = map_path.with_name("class-uses.json.gz")
         try:
-            with gzip.open(class_path, "rt") as handle:
+            with gzip.open(class_path, "rb") as handle:
                 parent_classes = json.load(handle)
             self.parent_class_map_valid = (
                 isinstance(parent_classes, dict)
@@ -584,7 +584,7 @@ class Impact:
             self.parser_lambda_import_calls = None
         pool_path = map_path.with_name("pool-classes.json.gz")
         try:
-            with gzip.open(pool_path, "rt") as handle:
+            with gzip.open(pool_path, "rb") as handle:
                 pool = json.load(handle)
         except (OSError, ValueError):
             pool = None
@@ -593,9 +593,23 @@ class Impact:
             for key, ids in pool["classes"].items():
                 self.class_uses.setdefault(key, set()).update(ids)
             self.subprocess.update(pool["nested"])
+        lambda_key_path = map_path.with_name("parser-lambda-key-calls.json.gz")
+        try:
+            with gzip.open(lambda_key_path, "rt") as handle:
+                lambda_keys = json.load(handle)
+        except (OSError, ValueError):
+            lambda_keys = None
+        self.lambda_call_uses = (
+            {tuple(row[:3]): set(row[3]) for row in lambda_keys["calls"]}
+            if self.valid_lambda_call_uses(lambda_keys, map_path) else None
+        )
+        self.lambda_import_uses = (set(map(tuple, lambda_keys["import_calls"]))
+                                   if self.lambda_call_uses is not None else None)
+        self.lambda_shared_uses = (set(map(tuple, lambda_keys["shared_calls"]))
+                                   if self.lambda_call_uses is not None else None)
         numeric_path = map_path.with_name("numeric-key-uses.json.gz")
         try:
-            with gzip.open(numeric_path, "rt") as handle:
+            with gzip.open(numeric_path, "rb") as handle:
                 numeric = json.load(handle)
         except (OSError, ValueError):
             numeric = None
@@ -619,7 +633,7 @@ class Impact:
         reference_path = map_path.with_name("reference-index.json.gz")
         self.reference_index = {}
         try:
-            with gzip.open(reference_path, "rt") as handle:
+            with gzip.open(reference_path, "rb") as handle:
                 reference = json.load(handle)
             if (isinstance(reference, dict)
                     and reference.get("impact_sha256") == hashlib.sha256(map_path.read_bytes()).hexdigest()
@@ -717,6 +731,41 @@ class Impact:
                     or any(type(field) is not str for field in fields)
                     or fields != sorted(set(fields))
                     or not set(fields) <= set(scalar["uses"][owner])):
+                return False
+        return True
+
+    def valid_lambda_call_uses(self, profile, map_path):
+        """Reject incomplete or stale clean-suite lambda call observations."""
+        if (self.pool_classes is None or not isinstance(profile, dict)
+                or set(profile) != {"calls", "import_calls", "shared_calls", "tasks", "callers",
+                                    "caller_tasks", "impact_sha256"}
+                or profile["impact_sha256"] != hashlib.sha256(map_path.read_bytes()).hexdigest()
+                or any(profile[name] != self.pool_classes[name]
+                       for name in ("tasks", "callers", "caller_tasks"))
+                or not isinstance(profile["calls"], list)
+                or not isinstance(profile["import_calls"], list)
+                or not isinstance(profile["shared_calls"], list)):
+            return False
+        triples = []
+        for row in profile["calls"]:
+            if (not isinstance(row, list) or len(row) != 4
+                    or type(row[0]) is not str or not row[0].startswith("sqlglot/parsers/")
+                    or row[0] not in self.sources or type(row[1]) is not int or row[1] < 1
+                    or type(row[2]) is not str or not row[2].endswith(".<lambda>")
+                    or not isinstance(row[3], list) or row[3] != sorted(set(row[3]))
+                    or any(type(nodeid) is not str for nodeid in row[3])
+                    or not set(row[3]) <= self.all_ids):
+                return False
+            triples.append(tuple(row[:3]))
+        if triples != sorted(set(triples)):
+            return False
+        for calls in (profile["import_calls"], profile["shared_calls"]):
+            if (any(not isinstance(row, list) or len(row) != 3
+                or type(row[0]) is not str or not row[0].startswith("sqlglot/parsers/")
+                or row[0] not in self.sources or type(row[1]) is not int or row[1] < 1
+                or type(row[2]) is not str or not row[2].endswith(".<lambda>")
+                for row in calls)
+                    or list(map(tuple, calls)) != sorted(set(map(tuple, calls)))):
                 return False
         return True
 
@@ -994,6 +1043,110 @@ class Impact:
         if any(direct in text for text in self.sources.values()):
             return False
         return True
+
+    def parser_lambda_call_readers(self, path, class_name, field, entry, patched):
+        """Use pristine calls only for a body edit with stable closure layout.
+
+        The dictionary key, callable arguments and its class construction are
+        unchanged by class_lambda_edit. A changed body cannot affect execution
+        until that callable is invoked, except for introspection of its code.
+        Retain source/reflective tests and explicit test-table references in
+        addition to the clean parent and spawned-worker call profile.
+        """
+        if self.lambda_call_uses is None:
+            return None
+        source = self.sources[path]
+        if len(source.splitlines()) != len(patched.splitlines()):
+            return None
+
+        def target(text):
+            tree = ast.parse(text)
+            owners = [node for node in tree.body if isinstance(node, ast.ClassDef)
+                      and node.name == class_name]
+            if len(owners) != 1:
+                return None
+            entries = []
+            for stmt in owners[0].body:
+                if (not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1
+                        or not isinstance(stmt.targets[0], ast.Name)
+                        or stmt.targets[0].id != field or not isinstance(stmt.value, ast.Dict)):
+                    continue
+                entries.extend(value for key, value in zip(stmt.value.keys, stmt.value.values)
+                               if isinstance(key, ast.Constant) and key.value == entry
+                               and isinstance(value, ast.Lambda))
+            return entries[0] if len(entries) == 1 else None
+
+        old, new = target(source), target(patched)
+        if old is None or new is None or old.lineno != new.lineno:
+            return None
+        scoped = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
+                  ast.GeneratorExp, ast.NamedExpr, ast.Yield, ast.YieldFrom,
+                  ast.Await)
+        for body in (old.body, new.body):
+            if any(isinstance(node, scoped)
+                   or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                       and node.func.id == "super") for node in ast.walk(body)):
+                return None
+
+        def names(node, context):
+            return sorted(child.id for child in ast.walk(node)
+                          if isinstance(child, ast.Name) and isinstance(child.ctx, context))
+        if (names(old.body, ast.Load) != names(new.body, ast.Load)
+                or names(old.body, (ast.Store, ast.Del))
+                != names(new.body, (ast.Store, ast.Del))
+                or "__class__" in names(old.body, ast.Load)):
+            return None
+        code_key = (path, old.lineno, class_name + ".<lambda>")
+        if code_key not in self.lambda_call_uses:
+            # An absent site is not proof of zero calls: keep the old readers.
+            return None
+        if code_key in self.lambda_import_uses or code_key in self.lambda_shared_uses:
+            return self.all_ids
+        selected = set(self.lambda_call_uses[code_key])
+        # The pinned library may dispatch a callable, inspect its name, or
+        # check dictionary membership; none observes a changed body before a
+        # call. An actual code-object/closure reader would need more than the
+        # call profile and so disables this exception.
+        for source_path, text in self.sources.items():
+            if not source_path.startswith("sqlglot/") or not any(
+                    token in text for token in ("__code__", "__closure__", "co_consts",
+                                                "co_code", "co_freevars", "FUNCTIONS")):
+                continue
+            tree = ast.parse(text)
+            if any(isinstance(node, ast.Attribute) and node.attr in {
+                    "__code__", "__closure__", "co_code", "co_consts", "co_freevars"}
+                   for node in ast.walk(tree)):
+                return None
+            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id == "getattr" and len(node.args) >= 2
+                   and isinstance(node.args[1], ast.Constant)
+                   and node.args[1].value == field for node in ast.walk(tree)):
+                return None
+        for test_path, text in self.sources.items():
+            if not test_path.startswith("tests/"):
+                continue
+            if ((class_name + "." + field in text)
+                    or any(token in text for token in
+                           ("__code__", "__closure__", "co_code", "co_consts", "co_freevars"))):
+                selected.update(self.by_file.get(test_path, ()))
+            if field not in text or entry not in text:
+                continue
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if (not isinstance(node, ast.Subscript)
+                        or not isinstance(node.value, ast.Attribute)
+                        or node.value.attr != field
+                        or not isinstance(node.slice, ast.Constant)
+                        or node.slice.value != entry):
+                    continue
+                index = self.lines.get(test_path, {}).get(str(node.lineno))
+                if index is None:
+                    return None
+                group = set(self.contexts[index])
+                if "" in group:
+                    return self.all_ids
+                selected.update(group)
+        return selected
 
     def parser_lambda_readers(self, path, class_name, field, entry):
         """Keep dynamic table readers and observed calls of the edited lambda.
@@ -1842,6 +1995,12 @@ class Impact:
                                     key = module + ":" + class_name
                                     readers = self.parser_lambda_readers(old, class_name, attr, entry)
                                     if readers is not None:
+                                        call_readers = self.parser_lambda_call_readers(
+                                            old, class_name, attr, entry, patched)
+                                        if call_readers is self.all_ids:
+                                            return self.all_ids
+                                        if call_readers is not None:
+                                            readers = call_readers
                                         selected.update(self.class_uses[key], readers, self.readers,
                                                         self.subprocess, self.unmapped,
                                                         self.class_unprofiled, self.reflective_tests,
