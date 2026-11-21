@@ -621,6 +621,100 @@ class Impact:
         self._class_references[name] = (selected, import_read)
         return selected, import_read
 
+    def factory_readers(self, path, class_name, field):
+        """Exclude a foreign class's proven local trie-key read of its own table.
+
+        This is used only after safe_parser_closure_factory has proved that a
+        value-only factory edit cannot change the target class's derived trie.
+        A bare name in another class body resolves to that class's preceding
+        assignment, so its read cannot consume the edited subclass table.
+        Every other reference retains the ordinary class-reader selection.
+        """
+        selected = set()
+        for source_path, text in self.sources.items():
+            if field not in text:
+                continue
+            try:
+                tree = ast.parse(text)
+            except (SyntaxError, RecursionError):
+                return self.all_ids
+            excluded = set()
+            trie_imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)
+                            and node.module == "sqlglot.trie"
+                            for alias in node.names
+                            if alias.name == "new_trie" and alias.asname is None]
+            trie_rebound = any(
+                isinstance(node, ast.Name) and node.id == "new_trie"
+                and isinstance(node.ctx, (ast.Store, ast.Del)) for node in ast.walk(tree)
+            ) or any(
+                (alias.asname or alias.name) == "new_trie"
+                and not (isinstance(node, ast.ImportFrom)
+                         and node.module == "sqlglot.trie"
+                         and alias.name == "new_trie" and alias.asname is None)
+                for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+                for alias in node.names
+            )
+            for owner in (node for node in tree.body if isinstance(node, ast.ClassDef)):
+                if ((source_path, owner.name) == (path, class_name)
+                        or owner.decorator_list or owner.keywords or trie_rebound
+                        or len(trie_imports) != 1):
+                    continue
+                fields = [stmt for stmt in owner.body if isinstance(stmt, ast.Assign)
+                          and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+                          and stmt.targets[0].id == field]
+                if (len(fields) != 1 or not isinstance(fields[0].value, ast.Dict)
+                        or not all(isinstance(key, ast.Constant) and isinstance(key.value, str)
+                                   for key in fields[0].value.keys)
+                        or [node for node in ast.walk(owner)
+                        if isinstance(node, ast.Name) and node.id == field
+                        and isinstance(node.ctx, (ast.Store, ast.Del))] != fields[0].targets):
+                    continue
+                has_local_field = False
+                for stmt in owner.body:
+                    if (has_local_field and isinstance(stmt, ast.Assign)
+                            and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+                            and stmt.targets[0].id == "SHOW_TRIE"
+                            and isinstance(stmt.value, ast.Call)
+                            and isinstance(stmt.value.func, ast.Name)
+                            and stmt.value.func.id == "new_trie"
+                            and len(stmt.value.args) == 1 and not stmt.value.keywords
+                            and isinstance(stmt.value.args[0], ast.GeneratorExp)
+                            and len(stmt.value.args[0].generators) == 1):
+                        generator = stmt.value.args[0]
+                        loop = generator.generators[0]
+                        if (not loop.ifs and not loop.is_async
+                                and isinstance(loop.iter, ast.Name) and loop.iter.id == field
+                                and isinstance(loop.target, ast.Name)
+                                and isinstance(generator.elt, ast.Call)
+                                and isinstance(generator.elt.func, ast.Attribute)
+                                and isinstance(generator.elt.func.value, ast.Name)
+                                and generator.elt.func.value.id == loop.target.id
+                                and generator.elt.func.attr == "split"
+                                and len(generator.elt.args) == 1
+                                and isinstance(generator.elt.args[0], ast.Constant)
+                                and generator.elt.args[0].value == " "
+                                and not generator.elt.keywords):
+                            excluded.add(loop.iter)
+                    if stmt is fields[0]:
+                        has_local_field = True
+            contexts = self.lines.get(source_path, {})
+            for node in ast.walk(tree):
+                if node in excluded:
+                    continue
+                if not ((isinstance(node, ast.Name) and node.id == field
+                         and isinstance(node.ctx, ast.Load))
+                        or (isinstance(node, ast.Attribute) and node.attr == field)
+                        or (isinstance(node, ast.Constant) and node.value == field)):
+                    continue
+                if hasattr(node, "lineno"):
+                    index = contexts.get(str(node.lineno))
+                    if index is not None:
+                        selected.update(self.contexts[index])
+                if source_path.startswith("tests/"):
+                    selected.update(self.by_file.get(source_path, ()))
+        selected.discard("")
+        return selected
+
     def safe_expression_arg_types(self, path, class_name, before, after):
         """Recognize a fixed-key bool schema and its pinned Expr construction hook.
 
@@ -1290,7 +1384,7 @@ class Impact:
                                 (class_name, attr, _), factory = edited_factory
                                 if self.safe_parser_closure_factory(old, class_name, attr, factory):
                                     key = old.removesuffix(".py").replace("/", ".") + ":" + class_name
-                                    readers, _ = self.class_readers(attr)
+                                    readers = self.factory_readers(old, class_name, attr)
                                     selected.update(self.class_uses[key], readers, self.readers,
                                                     self.subprocess, self.unmapped,
                                                     self.class_unprofiled, self.reflective_tests,
