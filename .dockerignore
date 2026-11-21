@@ -9,7 +9,9 @@
 !parser-lambda-import-calls.json
 !pool-classes.json.gz
 !numeric-key-uses.json.gz
+!scalar-reads.json.gz
 !reference-index.json.gz
+!comment-source-reads.json
 !fixture-reads.json
 !fixture-shared.json
 !LICENSE.sqlglot

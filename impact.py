@@ -1,10 +1,12 @@
 """Derive test impact from patches and maps of the clean checkout."""
 import ast
+from collections import deque
 from functools import lru_cache
 import gzip
 import hashlib
 import json
 import re
+import types
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -130,30 +132,31 @@ an inserted early return and a deleted late return can change every call.
     existing whole-function coverage fallback.
     """
     old_tree, new_tree = ast.parse(source), ast.parse(patched)
+    old_nodes, new_nodes = list(ast.walk(old_tree)), list(ast.walk(new_tree))
 
-    def bindings(tree):
-        return sorted((type(node.ctx).__name__, node.id) for node in ast.walk(tree)
+    def bindings(nodes):
+        return sorted((type(node.ctx).__name__, node.id) for node in nodes
                       if isinstance(node, ast.Name)
                       and isinstance(node.ctx, (ast.Store, ast.Del)))
 
-    if bindings(old_tree) != bindings(new_tree):
+    if bindings(old_nodes) != bindings(new_nodes):
         return None
 
-    def loads(tree):
-        return sorted(node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    def loads(nodes):
+        return sorted(node.id for node in nodes if isinstance(node, ast.Name)
                       and isinstance(node.ctx, ast.Load))
 
     # A new free name such as __class__ can change closure construction even
     # if its statement is never reached by a test.
-    if loads(old_tree) != loads(new_tree):
+    if loads(old_nodes) != loads(new_nodes):
         return None
 
     allowed = (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign,
                ast.Return, ast.Raise, ast.Assert, ast.Delete,
                ast.Import, ast.ImportFrom)
 
-    def statement(tree, lineno):
-        candidates = [node for node in ast.walk(tree) if isinstance(node, ast.stmt)
+    def statement(nodes, lineno):
+        candidates = [node for node in nodes if isinstance(node, ast.stmt)
                       and getattr(node, "lineno", -1) <= lineno <= getattr(node, "end_lineno", -1)]
         if not candidates:
             return None
@@ -174,8 +177,8 @@ an inserted early return and a deleted late return can change every call.
             return True
         if len(removed) != 1 or len(added) != 1:
             return False
-        before = statement(old_tree, removed[0])
-        after = statement(new_tree, added[0])
+        before = statement(old_nodes, removed[0])
+        after = statement(new_nodes, added[0])
         if before is None or after is None or type(before) is not type(after):
             return False
         if isinstance(before, ast.If) and (
@@ -246,6 +249,24 @@ def changed_source_header(source, patched):
         return False
     signature = re.compile(r"^#!|coding[:=]\s*[-\w.]+")
     return any(signature.search(line) for line in old + new)
+
+
+def same_comment_bytecode(source, patched, path):
+    """Compare executable code, ignoring only source locations recursively.
+
+    Source bytes and line positions can still be observed by test code, so
+    this check is paired with the pristine source-read audit and its review.
+    """
+    def without_locations(code):
+        return code.replace(
+            co_consts=tuple(without_locations(value) if isinstance(value, types.CodeType)
+                            else value for value in code.co_consts),
+            co_firstlineno=1,
+            co_linetable=b"",
+        )
+
+    return without_locations(compile(source, path, "exec")) == without_locations(
+        compile(patched, path, "exec"))
 
 
 def class_literal_edit(source, patched):
@@ -471,6 +492,55 @@ class Impact:
         self.contexts = self.maps.get("contexts", [])
         self.readers = self.files_to_ids(self.maps["source_readers"])
         self.subprocess = set(self.maps.get("subprocess", []))
+        # A clean-suite audit recorded explicit reads of pristine .py files.
+        # Comments can be skipped only if the audit matches this exact source
+        # snapshot and test manifest; otherwise keep the existing readers.
+        comment_path = map_path.with_name("comment-source-reads.json")
+        try:
+            payload = json.loads(comment_path.read_text())
+            read_map = payload["reads"]
+            observer = {"line_observers": payload["line_observers"],
+                        "global_line_observers": payload["global_line_observers"]}
+            if (set(payload) != {"impact_sha256", "pool_sha256", "ids_sha256",
+                                  "reads_sha256", "reads", "observer_sha256",
+                                  "line_observers", "global_line_observers"}
+                    or payload["impact_sha256"] != hashlib.sha256(map_path.read_bytes()).hexdigest()
+                    or payload["pool_sha256"] != hashlib.sha256(
+                        map_path.with_name("pool-classes.json.gz").read_bytes()
+                    ).hexdigest()
+                    or payload["ids_sha256"] != hashlib.sha256(
+                        json.dumps(sorted(self.all_ids), separators=(",", ":")).encode()
+                    ).hexdigest()
+                    or not isinstance(read_map, dict)
+                    or not isinstance(observer["line_observers"], dict)
+                    or not isinstance(observer["global_line_observers"], list)
+                    or observer["global_line_observers"] != sorted(
+                        set(observer["global_line_observers"]))
+                    or not set(observer["global_line_observers"]) <= self.all_ids
+                    or payload["observer_sha256"] != hashlib.sha256(
+                        json.dumps(observer, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+                    or payload["reads_sha256"] != hashlib.sha256(
+                        json.dumps(read_map, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+                    or any(not isinstance(path, str) or not path.startswith("sqlglot/")
+                           or path not in self.sources
+                           or not isinstance(ids, list) or ids != sorted(set(ids))
+                           or not set(ids) <= self.all_ids
+                           for path, ids in read_map.items())
+                    or any(not isinstance(path, str) or path not in self.sources
+                           or not isinstance(ids, list) or ids != sorted(set(ids))
+                           or not set(ids) <= self.all_ids
+                           for path, ids in observer["line_observers"].items())):
+                raise ValueError("comment source read map is stale or invalid")
+            self.comment_source_reads = {path: set(ids) for path, ids in read_map.items()}
+            self.comment_line_observers = {
+                path: set(ids) for path, ids in observer["line_observers"].items()}
+            self.global_comment_line_observers = set(observer["global_line_observers"])
+        except (OSError, KeyError, ValueError, TypeError):
+            self.comment_source_reads = None
+            self.comment_line_observers = {}
+            self.global_comment_line_observers = set()
         self.unmapped = self.all_ids.difference(
             test for group in self.contexts for test in group
         )
@@ -531,6 +601,13 @@ class Impact:
             numeric = None
         self.numeric_key_uses = (numeric if self.valid_numeric_key_uses(numeric, map_path)
                                  else None)
+        scalar_path = map_path.with_name("scalar-reads.json.gz")
+        try:
+            with gzip.open(scalar_path, "rt") as handle:
+                scalar = json.load(handle)
+        except (OSError, ValueError):
+            scalar = None
+        self.scalar_reads = (scalar if self.valid_scalar_reads(scalar, map_path) else None)
         self.class_unprofiled = self.all_ids - set().union(
             *(set(ids) for ids in self.class_uses.values())) if self.class_uses else set()
         self.reflective_tests = set()
@@ -603,6 +680,43 @@ class Impact:
                     or any(type(key) is not str for key in keys)
                     or keys != sorted(set(keys))
                     or not set(keys) <= set(numeric["uses"][owner])):
+                return False
+        return True
+
+    def valid_scalar_reads(self, scalar, map_path):
+        if (self.pool_classes is None or not isinstance(scalar, dict)
+                or set(scalar) != {"uses", "import_reads", "shared_reads", "names", "nested", "callers",
+                                   "caller_tasks", "tasks", "impact_sha256"}
+                or scalar["impact_sha256"] != hashlib.sha256(map_path.read_bytes()).hexdigest()
+                or any(scalar[name] != self.pool_classes[name] for name in
+                       ("callers", "caller_tasks", "tasks", "nested"))
+                or not isinstance(scalar["uses"], dict)
+                or not isinstance(scalar["import_reads"], dict)
+                or not isinstance(scalar["shared_reads"], dict)
+                or not isinstance(scalar["names"], list)
+                or any(type(name) is not str or not name.isupper() for name in scalar["names"])
+                or scalar["names"] != sorted(set(scalar["names"]))):
+            return False
+        names = set(scalar["names"])
+        for owner, fields in scalar["uses"].items():
+            if type(owner) is not str or not owner.startswith("sqlglot.") or not isinstance(fields, dict):
+                return False
+            for field, ids in fields.items():
+                if (field not in names or not isinstance(ids, list)
+                        or any(type(nodeid) is not str for nodeid in ids)
+                        or ids != sorted(set(ids)) or not set(ids) <= self.all_ids):
+                    return False
+        for owner, fields in scalar["import_reads"].items():
+            if (owner not in scalar["uses"] or not isinstance(fields, list)
+                    or any(type(field) is not str for field in fields)
+                    or fields != sorted(set(fields))
+                    or not set(fields) <= set(scalar["uses"][owner])):
+                return False
+        for owner, fields in scalar["shared_reads"].items():
+            if (owner not in scalar["uses"] or not isinstance(fields, list)
+                    or any(type(field) is not str for field in fields)
+                    or fields != sorted(set(fields))
+                    or not set(fields) <= set(scalar["uses"][owner])):
                 return False
         return True
 
@@ -694,6 +808,7 @@ class Impact:
                 tree = ast.parse(text)
             except (SyntaxError, RecursionError):
                 return self.all_ids
+            nodes = list(ast.walk(tree))
             excluded = set()
             trie_imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)
                             and node.module == "sqlglot.trie"
@@ -701,13 +816,13 @@ class Impact:
                             if alias.name == "new_trie" and alias.asname is None]
             trie_rebound = any(
                 isinstance(node, ast.Name) and node.id == "new_trie"
-                and isinstance(node.ctx, (ast.Store, ast.Del)) for node in ast.walk(tree)
+                and isinstance(node.ctx, (ast.Store, ast.Del)) for node in nodes
             ) or any(
                 (alias.asname or alias.name) == "new_trie"
                 and not (isinstance(node, ast.ImportFrom)
                          and node.module == "sqlglot.trie"
                          and alias.name == "new_trie" and alias.asname is None)
-                for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+                for node in nodes if isinstance(node, (ast.Import, ast.ImportFrom))
                 for alias in node.names
             )
             for owner in (node for node in tree.body if isinstance(node, ast.ClassDef)):
@@ -754,7 +869,7 @@ class Impact:
                     if stmt is fields[0]:
                         has_local_field = True
             contexts = self.lines.get(source_path, {})
-            for node in ast.walk(tree):
+            for node in nodes:
                 if node in excluded:
                     continue
                 if not ((isinstance(node, ast.Name) and node.id == field
@@ -967,14 +1082,20 @@ class Impact:
             if field not in text:
                 continue
             root = tree if source_path == path else ast.parse(text)
-            parents = {child: node for node in ast.walk(root)
-                       for child in ast.iter_child_nodes(node)}
+            nodes, parents = [], {}
+            pending = deque([root])
+            while pending:
+                parent = pending.popleft()
+                nodes.append(parent)
+                for child in ast.iter_child_nodes(parent):
+                    parents[child] = parent
+                    pending.append(child)
             aliases = {class_name}
             for imp in root.body:
                 if isinstance(imp, ast.ImportFrom) and imp.module == target_module:
                     aliases.update((alias.asname or alias.name) for alias in imp.names
                                    if alias.name == class_name)
-            for candidate in ast.walk(root):
+            for candidate in nodes:
                 if not isinstance(candidate, ast.ClassDef):
                     continue
                 if any((isinstance(base, ast.Name) and base.id in aliases)
@@ -998,7 +1119,7 @@ class Impact:
                             and isinstance(node.ctx, ast.Load))
                         or (isinstance(node, ast.Constant) and node.value == field))
 
-            for node in ast.walk(root):
+            for node in nodes:
                 if not is_read(node):
                     continue
                 if source_path.startswith("tests/"):
@@ -1476,6 +1597,143 @@ class Impact:
                     return False
         return True
 
+    def safe_dialect_scalar_reads(self, path, class_name, attr, before, after, import_read):
+        """Use clean actual reads of one immutable dialect field.
+
+        Class and instance `__getattribute__` probes observe dynamically named
+        reads too. Direct class-dictionary inspection by tests remains covered
+        by the reflective guard; import-time reads cannot be narrowed.
+        """
+        if (self.scalar_reads is None or import_read or not attr.isupper()
+                or attr not in self.scalar_reads["names"]
+                or type(before) not in (bool, int, str, float)
+                or type(before) is not type(after)
+                or not path.startswith("sqlglot/dialects/")
+                or not self.scalar_cached_read_safe(attr)
+                or not self.numeric_pool_inputs_safe()):
+            return False
+        key = path.removesuffix(".py").replace("/", ".") + ":" + class_name
+        if (attr in self.scalar_reads["import_reads"].get(key, ())
+                or attr in self.scalar_reads["shared_reads"].get(key, ())):
+            return False
+        tree = ast.parse(self.sources[path])
+        owners = [node for node in tree.body if isinstance(node, ast.ClassDef)
+                  and node.name == class_name]
+        if (len(owners) != 1 or owners[0].keywords or owners[0].decorator_list
+                or len(owners[0].bases) != 1
+                or not isinstance(owners[0].bases[0], ast.Name)
+                or owners[0].bases[0].id != "Dialect"
+                or any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and node.name in {"__getattribute__", "__getattr__"}
+                       for node in owners[0].body)):
+            return False
+        # The metaclass's class-dictionary reads use fixed string keys. A
+        # dynamic key could bypass the runtime attribute probe.
+        dialect = ast.parse(self.sources["sqlglot/dialects/dialect.py"])
+        metaclass = next((node for node in dialect.body if isinstance(node, ast.ClassDef)
+                          and node.name == "_Dialect"), None)
+        if metaclass is None:
+            return False
+        dict_reads = [node for node in ast.walk(metaclass)
+                      if isinstance(node, ast.Attribute) and node.attr == "__dict__"
+                      and isinstance(node.ctx, ast.Load)]
+        for node in dict_reads:
+            # Every class-dictionary read is a fixed-key `.get` or derives a
+            # tokenizer/parser/generator class via the same fixed-key lookup.
+            parents = {child: parent for parent in ast.walk(metaclass)
+                       for child in ast.iter_child_nodes(parent)}
+            method = parents.get(node)
+            call = parents.get(method)
+            if (not isinstance(method, ast.Attribute) or method.attr != "get"
+                    or not isinstance(call, ast.Call) or call.func is not method
+                    or not call.args or not isinstance(call.args[0], ast.Constant)
+                    or type(call.args[0].value) is not str):
+                return False
+        indirect = set()
+        for source_path, source in self.sources.items():
+            if source_path.startswith("sqlglot/dialects/"):
+                for owner in ast.walk(ast.parse(source)):
+                    if (isinstance(owner, ast.ClassDef)
+                            and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                    and member.name in {"__getattribute__", "__getattr__"}
+                                    for member in owner.body)):
+                        return False
+            if (source_path.startswith(("sqlglot/", "tests/"))
+                    and "object_to_dict(" in source):
+                tree = ast.parse(source)
+                if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                       and node.func.id == "object_to_dict" for node in ast.walk(tree)):
+                    return False
+            if not source_path.startswith("sqlglot/") or not any(
+                    token in source for token in ("__dict__", "vars(")):
+                continue
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == "vars"):
+                    if (source_path != "sqlglot/helper.py"
+                            or ast.unparse(node) != "vars(obj)"):
+                        return False
+                if (not isinstance(node, ast.Attribute) or node.attr != "__dict__"
+                        or not isinstance(node.ctx, ast.Load)):
+                    continue
+                shape = ast.unparse(node)
+                if source_path == "sqlglot/dialects/dialect.py" and shape == "klass.__dict__":
+                    continue  # fixed-key metaclass reads proved above
+                if source_path == "sqlglot/tokens.py" and shape == "k.__dict__":
+                    parents = {child: parent for parent in ast.walk(tree)
+                               for child in ast.iter_child_nodes(parent)}
+                    compare = parents.get(node)
+                    if (not isinstance(compare, ast.Compare) or len(compare.ops) != 1
+                            or not isinstance(compare.ops[0], ast.In)
+                            or not isinstance(compare.left, ast.Constant)
+                            or compare.left.value != "BYTE_STRING_ESCAPES"
+                            or attr == "BYTE_STRING_ESCAPES"):
+                        return False
+                    continue  # fixed, unrelated dictionary membership
+                if source_path == "sqlglot/expressions/core.py" and shape == "value.__dict__":
+                    index = self.lines.get(source_path, {}).get(str(node.lineno))
+                    if index is None or "" in self.contexts[index]:
+                        return False
+                    indirect.update(self.contexts[index])
+                    continue
+                return False
+        self._scalar_indirect = indirect
+        return True
+
+    @lru_cache(maxsize=128)
+    def scalar_cached_read_safe(self, attr):
+        """Reject fields read in a function that may persist derived state.
+
+        A later test can consume the cached result without reading the field.
+        This excludes MappingSchema._to_data_type's cache-miss read of
+        SUPPORTS_USER_DEFINED_TYPES, along with other attribute/subscript
+        stores even if their target is not named 'cache'.
+        """
+        for path, source in self.sources.items():
+            if not path.startswith("sqlglot/") or attr not in source:
+                continue
+            tree = ast.parse(source)
+            for function in ast.walk(tree):
+                if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not any(isinstance(node, ast.Attribute) and node.attr == attr
+                           and isinstance(node.ctx, ast.Load) for node in ast.walk(function)):
+                    continue
+                if function.name in {"__init__", "__new__", "__init_subclass__", "_init_core"}:
+                    return False
+                if any("cache" in ast.unparse(decorator).lower()
+                       for decorator in function.decorator_list):
+                    return False
+                if any(isinstance(node, (ast.Global, ast.Nonlocal))
+                       for node in ast.walk(function)):
+                    return False
+                if any(isinstance(node, (ast.Attribute, ast.Subscript))
+                       and isinstance(node.ctx, (ast.Store, ast.Del))
+                       for node in ast.walk(function)):
+                    return False
+        return True
+
     def files_to_ids(self, files):
         return set().union(*(self.by_file.get(path, set()) for path in files))
 
@@ -1540,6 +1798,14 @@ class Impact:
                             ast.parse(patched, type_comments=True)
                         ):
                             return self.all_ids
+                        if (len(edits) == 1 and old.startswith("sqlglot/")
+                                and self.comment_source_reads is not None
+                                and self.pool_classes is not None
+                                and same_comment_bytecode(source, patched, old)):
+                            selected.update(self.comment_source_reads.get(old, ()))
+                            selected.update(self.comment_line_observers.get(old, ()),
+                                            self.global_comment_line_observers)
+                            continue
                         selected.update(self.readers, self.subprocess, self.unmapped)
                         selected.update(self.by_file.get(old, ()))
                         continue
@@ -1625,6 +1891,14 @@ class Impact:
                                         or key in self.class_import_constructors):
                                     return self.all_ids
                                 readers, import_read = self.class_readers(attr)
+                                if self.safe_dialect_scalar_reads(old, class_name, attr,
+                                                                  before, after, import_read):
+                                    users = set(self.scalar_reads["uses"].get(key, {}).get(attr, ()))
+                                    selected.update(users, readers, self._scalar_indirect,
+                                                    self.reflective_tests,
+                                                    self.readers, self.subprocess, self.unmapped,
+                                                    self.class_unprofiled, self.by_file.get(old, ()))
+                                    continue
                                 expression_schema = (attr == "arg_types" and
                                     self.safe_expression_arg_types(old, class_name, before, after))
                                 if expression_schema and key in self.class_import_reads:
