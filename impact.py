@@ -13,6 +13,25 @@ PARSER_LAMBDA_READER_INDEX_VERSION = 1
 NUMERIC_SAFETY_INDEX_VERSION = 1
 
 
+def walk_nodes(node):
+    """Visit AST nodes in the same breadth-first order as ast.walk."""
+    queue = deque([node])
+    while queue:
+        current = queue.popleft()
+        yield current
+        for name in current._fields:
+            try:
+                value = getattr(current, name)
+            except AttributeError:
+                continue
+            if isinstance(value, ast.AST):
+                queue.append(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        queue.append(item)
+
+
 def sections(patch):
     files = []
     for line in patch.splitlines(keepends=True):
@@ -134,7 +153,7 @@ an inserted early return and a deleted late return can change every call.
     existing whole-function coverage fallback.
     """
     old_tree, new_tree = ast.parse(source), ast.parse(patched)
-    old_nodes, new_nodes = list(ast.walk(old_tree)), list(ast.walk(new_tree))
+    old_nodes, new_nodes = list(walk_nodes(old_tree)), list(walk_nodes(new_tree))
 
     def bindings(nodes):
         return sorted((type(node.ctx).__name__, node.id) for node in nodes
@@ -197,7 +216,7 @@ an inserted early return and a deleted late return can change every call.
                       ast.GeneratorExp, ast.NamedExpr, ast.Yield, ast.YieldFrom,
                       ast.Await)
             if any(isinstance(node, scoped) for test in (before.test, after.test)
-                   for node in ast.walk(test)):
+                   for node in walk_nodes(test)):
                 return False
         pairs.append((removed[0], removed[0]))
         removed.clear()
@@ -921,7 +940,7 @@ class Impact:
             return any((isinstance(child, ast.Name) and child.id == name and isinstance(child.ctx, ast.Load))
                        or (isinstance(child, ast.Attribute) and child.attr == name)
                        or (isinstance(child, ast.Constant) and child.value == name)
-                       for child in ast.walk(node))
+                       for child in walk_nodes(node))
 
         def direct_mention(node):
             return ((isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load))
@@ -953,7 +972,7 @@ class Impact:
                 continue
             scan_body(tree.body)
             contexts = self.lines.get(path, {})
-            for node in ast.walk(tree):
+            for node in walk_nodes(tree):
                 if not direct_mention(node):
                     continue
                 if hasattr(node, "lineno"):
@@ -986,7 +1005,7 @@ class Impact:
                 tree = self.source_tree(source_path)
             except (SyntaxError, RecursionError):
                 return self.all_ids
-            nodes = list(ast.walk(tree))
+            nodes = list(walk_nodes(tree))
             excluded = set()
             trie_imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)
                             and node.module == "sqlglot.trie"
@@ -1014,7 +1033,7 @@ class Impact:
                 if (len(fields) != 1 or not isinstance(fields[0].value, ast.Dict)
                         or not all(isinstance(key, ast.Constant) and isinstance(key.value, str)
                                    for key in fields[0].value.keys)
-                        or [node for node in ast.walk(owner)
+                        or [node for node in walk_nodes(owner)
                         if isinstance(node, ast.Name) and node.id == field
                         and isinstance(node.ctx, (ast.Store, ast.Del))] != fields[0].targets):
                     continue
@@ -1080,7 +1099,7 @@ class Impact:
         source = self.sources.get(path, "")
         tree = self.source_tree(path)
         target = None
-        for node in ast.walk(tree):
+        for node in walk_nodes(tree):
             if (isinstance(node, ast.ClassDef) and node.name == class_name.rsplit(".", 1)[-1]
                     and any(isinstance(base, ast.Name) and base.id in ("Expr", "Expression")
                             for base in node.bases)):
@@ -1105,7 +1124,7 @@ class Impact:
         for source_path, text in self.sources.items():
             if "required_args" not in text:
                 continue
-            for node in ast.walk(self.source_tree(source_path)):
+            for node in walk_nodes(self.source_tree(source_path)):
                 if (isinstance(node, ast.Attribute) and node.attr == "required_args"
                         and isinstance(node.ctx, ast.Load)):
                     derived_sites.append((source_path, node.lineno))
@@ -1115,7 +1134,7 @@ class Impact:
         if validation is None:
             return False
         expected_sites = [("sqlglot/expressions/core.py", node.lineno)
-                          for node in ast.walk(validation)
+                          for node in walk_nodes(validation)
                           if (isinstance(node, ast.Attribute) and node.attr == "required_args"
                               and isinstance(node.ctx, ast.Load))]
         if len(expected_sites) != 1 or derived_sites != expected_sites:
@@ -1217,11 +1236,11 @@ class Impact:
         for body in (old.body, new.body):
             if any(isinstance(node, scoped)
                    or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                       and node.func.id == "super") for node in ast.walk(body)):
+                       and node.func.id == "super") for node in walk_nodes(body)):
                 return self.all_ids
 
         def names(node, context):
-            return sorted(child.id for child in ast.walk(node)
+            return sorted(child.id for child in walk_nodes(node)
                           if isinstance(child, ast.Name) and isinstance(child.ctx, context))
         if (names(old.body, ast.Load) != names(new.body, ast.Load)
                 or names(old.body, (ast.Store, ast.Del))
@@ -1247,7 +1266,7 @@ class Impact:
                     any(token in text for token in code_fields)
                     or (field in text and "getattr" in text)):
                 continue
-            for node in ast.walk(self.source_tree(source_path)):
+            for node in walk_nodes(self.source_tree(source_path)):
                 if (isinstance(node, ast.Attribute) and node.attr in code_fields
                         or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                         and node.func.id == "getattr" and len(node.args) >= 2
@@ -1264,7 +1283,7 @@ class Impact:
             if field not in text or entry not in text:
                 continue
             tree = self.source_tree(test_path)
-            for node in ast.walk(tree):
+            for node in walk_nodes(tree):
                 if (not isinstance(node, ast.Subscript)
                         or not isinstance(node.value, ast.Attribute)
                         or node.value.attr != field
@@ -1447,7 +1466,7 @@ class Impact:
                     if ancestor.name == class_name and source_path == path:
                         # An unexpected import-time read of the edited table
                         # could construct persistent state for other tests.
-                        if node not in ast.walk(fields[0]):
+                        if node not in walk_nodes(fields[0]):
                             return None
                         continue
                     if isinstance(node, ast.Constant) and ancestor.name != class_name:
@@ -1566,7 +1585,7 @@ class Impact:
                         for alias in n.names if alias.name == "new_trie" and alias.asname is None]
         if (len(trie_imports) != 1 or any(
                 isinstance(n, ast.Name) and n.id == "new_trie"
-                and isinstance(n.ctx, (ast.Store, ast.Del)) for n in ast.walk(source))):
+                and isinstance(n.ctx, (ast.Store, ast.Del)) for n in walk_nodes(source))):
             return False
         for stmt in owner.body:
             if stmt is fields[0]:
@@ -1575,7 +1594,7 @@ class Impact:
                         and isinstance(n.ctx, ast.Load))
                        or (isinstance(n, ast.Attribute) and n.attr == field)
                        or (isinstance(n, ast.Constant) and n.value == field)
-                       for n in ast.walk(stmt)):
+                       for n in walk_nodes(stmt)):
                 continue
             # A derived trie can depend on the table's keys, but not its
             # changed closure or values.
@@ -1604,7 +1623,7 @@ class Impact:
                     and isinstance(stmt.value.args[0].elt.args[0], ast.Constant)
                     and stmt.value.args[0].elt.args[0].value == " "
                     and not stmt.value.args[0].elt.keywords
-                    and [n for n in ast.walk(stmt) if isinstance(n, ast.Name)
+                    and [n for n in walk_nodes(stmt) if isinstance(n, ast.Name)
                          and n.id == field and isinstance(n.ctx, ast.Load)]
                     == [stmt.value.args[0].generators[0].iter]):
                 return False
@@ -1617,13 +1636,13 @@ class Impact:
         for source_path, text in self.sources.items():
             if not source_path.startswith("sqlglot/") or field not in text:
                 continue
-            for node in ast.walk(source if source_path == path else ast.parse(text)):
+            for node in walk_nodes(source if source_path == path else ast.parse(text)):
                 if not (isinstance(node, ast.Attribute) and node.attr == field
                         and isinstance(node.ctx, ast.Load)):
                     continue
                 base_copy = (source_path == path and isinstance(node.value, ast.Name)
                              and node.value.id == owner_base
-                             and any(node in ast.walk(field_node) for field_node in fields))
+                             and any(node in walk_nodes(field_node) for field_node in fields))
                 runtime_read = (source_path == "sqlglot/parser.py"
                                 and isinstance(node.value, ast.Name)
                                 and node.value.id == "self")
@@ -1720,7 +1739,7 @@ class Impact:
             if not source_path.startswith("sqlglot/") or "NUMERIC_ESCAPES" not in text:
                 continue
             tree = ast.parse(text)
-            reads = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+            reads = [n for n in walk_nodes(tree) if isinstance(n, ast.Attribute)
                      and n.attr == "NUMERIC_ESCAPES" and isinstance(n.ctx, ast.Load)]
             if reads:
                 core_reads[source_path] = len(reads)
@@ -1729,9 +1748,9 @@ class Impact:
                           "sqlglot/tokens.py": 1}:
             return False
         generator = ast.parse(self.sources["sqlglot/generator.py"])
-        ancestors = {child: node for node in ast.walk(generator)
+        ancestors = {child: node for node in walk_nodes(generator)
                      for child in ast.iter_child_nodes(node)}
-        generator_reads = [node for node in ast.walk(generator)
+        generator_reads = [node for node in walk_nodes(generator)
                            if isinstance(node, ast.Attribute)
                            and node.attr == "NUMERIC_ESCAPES" and isinstance(node.ctx, ast.Load)]
         # A generator only tests whether the table is nonempty or contains
@@ -1754,15 +1773,15 @@ class Impact:
                        and n.name == "__new__"), None) if meta else None
         if method is None:
             return False
-        assignments = [n for n in ast.walk(method) if isinstance(n, ast.Assign)
+        assignments = [n for n in walk_nodes(method) if isinstance(n, ast.Assign)
                        and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
                        and n.targets[0].id == "numeric_escapes"]
         if (len(assignments) != 1 or not isinstance(assignments[0].value, ast.Attribute)
                 or assignments[0].value.attr != "NUMERIC_ESCAPES"):
             return False
-        references = [n for n in ast.walk(method) if isinstance(n, ast.Name)
+        references = [n for n in walk_nodes(method) if isinstance(n, ast.Name)
                       and n.id == "numeric_escapes" and isinstance(n.ctx, ast.Load)]
-        comparisons = [n for n in ast.walk(method) if isinstance(n, ast.Compare)
+        comparisons = [n for n in walk_nodes(method) if isinstance(n, ast.Compare)
                        and len(n.ops) == 1 and isinstance(n.ops[0], ast.In)
                        and isinstance(n.left, ast.Constant) and type(n.left.value) is str
                        and len(n.comparators) == 1 and isinstance(n.comparators[0], ast.Name)
@@ -1794,14 +1813,14 @@ class Impact:
             tree = ast.parse(source)
             if path.startswith("sqlglot/dialects/") and any(
                     isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name == "_init_core" for node in ast.walk(tree)):
+                    and node.name == "_init_core" for node in walk_nodes(tree)):
                 return False
             if path != "sqlglot/tokenizer_core.py" and any(
                     isinstance(node, ast.Attribute) and node.attr == "numeric_escapes"
-                    and isinstance(node.ctx, ast.Load) for node in ast.walk(tree)):
+                    and isinstance(node.ctx, ast.Load) for node in walk_nodes(tree)):
                 return False
         tree = ast.parse(self.sources["sqlglot/tokenizer_core.py"])
-        all_accesses = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        all_accesses = [node for node in walk_nodes(tree) if isinstance(node, ast.Attribute)
                         and node.attr == "numeric_escapes"]
         if len(all_accesses) != 4 or sum(isinstance(node.ctx, ast.Load)
                                          for node in all_accesses) != 3:
@@ -1814,7 +1833,7 @@ class Impact:
         for method in core.body:
             if not isinstance(method, ast.FunctionDef):
                 continue
-            hits = [node for node in ast.walk(method) if isinstance(node, ast.Attribute)
+            hits = [node for node in walk_nodes(method) if isinstance(node, ast.Attribute)
                     and node.attr == "numeric_escapes"]
             if hits:
                 accesses[method.name] = hits
@@ -1827,9 +1846,9 @@ class Impact:
             return False
         init = next(node for node in core.body if isinstance(node, ast.FunctionDef)
                     and node.name == "__init__")
-        init_reads = [node for node in ast.walk(init) if isinstance(node, ast.Name)
+        init_reads = [node for node in walk_nodes(init) if isinstance(node, ast.Name)
                       and node.id == "numeric_escapes" and isinstance(node.ctx, ast.Load)]
-        init_assignments = [node for node in ast.walk(init) if isinstance(node, ast.Assign)
+        init_assignments = [node for node in walk_nodes(init) if isinstance(node, ast.Assign)
                             and len(node.targets) == 1
                             and node.targets[0] is accesses["__init__"][0]
                             and node.value in init_reads]
@@ -1842,7 +1861,7 @@ class Impact:
                           and node.name == "_init_core"), None) if tokenizer else None
         if init_core is None:
             return False
-        transfers = [kw for call in ast.walk(init_core) if isinstance(call, ast.Call)
+        transfers = [kw for call in walk_nodes(init_core) if isinstance(call, ast.Call)
                      and isinstance(call.func, ast.Name) and call.func.id == "TokenizerCore"
                      for kw in call.keywords if kw.arg == "numeric_escapes"
                      and ast.unparse(kw.value) == "self.NUMERIC_ESCAPES"]
@@ -1851,7 +1870,7 @@ class Impact:
         for name in ("_read_byte_escape", "_scan_numeric_escape"):
             method = next(node for node in core.body if isinstance(node, ast.FunctionDef)
                           and node.name == name)
-            gets = [node for node in ast.walk(method) if isinstance(node, ast.Call)
+            gets = [node for node in walk_nodes(method) if isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
                     and node.func.value is accesses[name][0]]
             if (len(gets) != 1 or len(gets[0].args) != 1 or gets[0].keywords
@@ -1859,9 +1878,9 @@ class Impact:
                 return False
         extract = next(node for node in core.body if isinstance(node, ast.FunctionDef)
                        and node.name == "_extract_string")
-        name_reads = [n for n in ast.walk(extract) if isinstance(n, ast.Name)
+        name_reads = [n for n in walk_nodes(extract) if isinstance(n, ast.Name)
                       and n.id == "numeric_escapes" and isinstance(n.ctx, ast.Load)]
-        guards = [n for n in ast.walk(extract) if isinstance(n, ast.BoolOp)
+        guards = [n for n in walk_nodes(extract) if isinstance(n, ast.BoolOp)
                   and isinstance(n.op, ast.And) and len(n.values) == 2
                   and n.values[1] in name_reads]
         return len(name_reads) == 1 and len(guards) == 1
@@ -1885,7 +1904,7 @@ class Impact:
         }
         for path, invocation in expected.items():
             tree = self.source_tree(path)
-            submits = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+            submits = [node for node in walk_nodes(tree) if isinstance(node, ast.Call)
                        and isinstance(node.func, ast.Attribute)
                        and node.func.attr == "submit"]
             if len(submits) != 1 or ast.unparse(submits[0]) != invocation:
@@ -1936,10 +1955,10 @@ class Impact:
                           and node.name == "_Dialect"), None)
         if metaclass is None:
             return False
-        dict_reads = [node for node in ast.walk(metaclass)
+        dict_reads = [node for node in walk_nodes(metaclass)
                       if isinstance(node, ast.Attribute) and node.attr == "__dict__"
                       and isinstance(node.ctx, ast.Load)]
-        metaclass_parents = {child: parent for parent in ast.walk(metaclass)
+        metaclass_parents = {child: parent for parent in walk_nodes(metaclass)
                              for child in ast.iter_child_nodes(parent)}
         for node in dict_reads:
             # Every class-dictionary read is a fixed-key `.get` or derives a
@@ -1968,7 +1987,7 @@ class Impact:
         for source_path, source in self.sources.items():
             if (source_path.startswith("sqlglot/dialects/")
                     and ("__getattribute__" in source or "__getattr__" in source)):
-                for owner in ast.walk(self.source_tree(source_path)):
+                for owner in walk_nodes(self.source_tree(source_path)):
                     if (isinstance(owner, ast.ClassDef)
                             and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
                                     and member.name in {"__getattribute__", "__getattr__"}
@@ -1978,13 +1997,13 @@ class Impact:
                     and "object_to_dict(" in source):
                 tree = self.source_tree(source_path)
                 if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                       and node.func.id == "object_to_dict" for node in ast.walk(tree)):
+                       and node.func.id == "object_to_dict" for node in walk_nodes(tree)):
                     return None
             if not source_path.startswith("sqlglot/") or not any(
                     token in source for token in ("__dict__", "vars(")):
                 continue
             tree = self.source_tree(source_path)
-            for node in ast.walk(tree):
+            for node in walk_nodes(tree):
                 if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                         and node.func.id == "vars"):
                     if (source_path != "sqlglot/helper.py"
@@ -1997,7 +2016,7 @@ class Impact:
                 if source_path == "sqlglot/dialects/dialect.py" and shape == "klass.__dict__":
                     continue  # fixed-key metaclass reads proved above
                 if source_path == "sqlglot/tokens.py" and shape == "k.__dict__":
-                    parents = {child: parent for parent in ast.walk(tree)
+                    parents = {child: parent for parent in walk_nodes(tree)
                                for child in ast.iter_child_nodes(parent)}
                     compare = parents.get(node)
                     if (not isinstance(compare, ast.Compare) or len(compare.ops) != 1
@@ -2029,11 +2048,11 @@ class Impact:
             if not path.startswith("sqlglot/") or attr not in source:
                 continue
             tree = self.source_tree(path)
-            for function in ast.walk(tree):
+            for function in walk_nodes(tree):
                 if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 if not any(isinstance(node, ast.Attribute) and node.attr == attr
-                           and isinstance(node.ctx, ast.Load) for node in ast.walk(function)):
+                           and isinstance(node.ctx, ast.Load) for node in walk_nodes(function)):
                     continue
                 if function.name in {"__init__", "__new__", "__init_subclass__", "_init_core"}:
                     return False
@@ -2041,11 +2060,11 @@ class Impact:
                        for decorator in function.decorator_list):
                     return False
                 if any(isinstance(node, (ast.Global, ast.Nonlocal))
-                       for node in ast.walk(function)):
+                       for node in walk_nodes(function)):
                     return False
                 if any(isinstance(node, (ast.Attribute, ast.Subscript))
                        and isinstance(node.ctx, (ast.Store, ast.Del))
-                       for node in ast.walk(function)):
+                       for node in walk_nodes(function)):
                     return False
         return True
 
