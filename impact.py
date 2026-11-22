@@ -126,7 +126,13 @@ class FunctionBodies(ast.NodeTransformer):
 def body_shape(source):
     tree = ast.parse(source)
     visitor = FunctionBodies()
-    visitor.visit(tree)
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            visitor.visit_FunctionDef(node)
+        else:
+            pending.extend(reversed(list(ast.iter_child_nodes(node))))
     return ast.dump(tree), visitor.bodies
 
 
