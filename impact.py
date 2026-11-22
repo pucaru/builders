@@ -1866,9 +1866,11 @@ class Impact:
                   and n.values[1] in name_reads]
         return len(name_reads) == 1 and len(guards) == 1
 
+    @lru_cache(maxsize=1)
     def numeric_pool_inputs_safe(self):
         """Check worker arguments before the profiling hook becomes active.
 
+        This proof reads only the pinned, unmodified test sources.
         The optimizer sends a function and fixture strings/dicts. The executor
         constructs its Expr in the traced parent before submitting it. Its
         worker initializer merely stores schema and table arguments.
@@ -1882,7 +1884,7 @@ class Impact:
             "tests/test_executor.py": "pool.submit(mp_execute, parse_one(sql), args)",
         }
         for path, invocation in expected.items():
-            tree = ast.parse(self.sources[path])
+            tree = self.source_tree(path)
             submits = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                        and isinstance(node.func, ast.Attribute)
                        and node.func.attr == "submit"]
